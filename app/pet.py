@@ -45,22 +45,39 @@ def format_latency(milliseconds):
     except (InvalidOperation,ValueError,TypeError):return None
 
 
-def panel_positions(pet,sizes,area,blockers=(),gap=10):
-    """Place each floating panel near the pet while reserving other surfaces."""
+def panel_positions(pet,sizes,area,blockers=(),gap=10,scale=1.0):
+    """Return speech/report/quota anchors, reserving all three roles even when hidden."""
+    speech_size,report_size,quota_size=sizes
+    # Empty windows have no useful size yet. Stable reservations also keep a
+    # one-line greeting or a short report from moving the other panel anchors.
+    reserved=[QSize(max(speech_size.width(),round(300*scale)),max(speech_size.height(),round(140*scale))),
+              QSize(max(report_size.width(),round(300*scale)),max(report_size.height(),round(260*scale))),
+              QSize(max(quota_size.width(),round(280*scale)),max(quota_size.height(),round(320*scale)))]
     occupied=[QRect(rect) for rect in blockers]
-    placements=[]
+    placements=[None]*3;slots={}
     def overlap(a,b):
         rect=a.intersected(b)
         return max(0,rect.width())*max(0,rect.height())
-    for size in sizes:
+    # Quota always takes a side first; speech stays near the head, and the
+    # report uses its own area above it (or the nearest clear space at edges).
+    for role in (2,0,1):
+        size=reserved[role]
         width,height=size.width(),size.height()
-        preferred=QPoint(pet.center().x()-width//2,pet.top()-height-gap)
+        if role==2:
+            left_space=pet.left()-area.left();right_space=area.right()-pet.right()
+            x=pet.right()+gap+1 if right_space>=left_space else pet.left()-width-gap
+            preferred=QPoint(x,pet.center().y()-height//2)
+        elif role==0:preferred=QPoint(pet.center().x()-width//2,pet.top()-height-gap)
+        else:preferred=QPoint(pet.center().x()-width//2,slots[0].top()-height-gap)
         xs=[preferred.x(),pet.right()+gap+1,pet.left()-width-gap,area.left(),area.right()-width+1]
         ys=[preferred.y(),pet.bottom()+gap+1,pet.center().y()-height//2,area.top(),area.bottom()-height+1]
         for rect in occupied:
             xs.extend((rect.left()-width-gap,rect.right()+gap+1,rect.left()))
             ys.extend((rect.top()-height-gap,rect.bottom()+gap+1,rect.top()))
         candidates={ (point.x(),point.y()) for x in xs for y in ys for point in [clamp_position(QPoint(x,y),size,area)] }
+        if role==2:
+            side_candidates={point for point in candidates if point[0]+width+gap<=pet.left() or point[0]>=pet.right()+gap+1}
+            if side_candidates:candidates=side_candidates
         def score(point):
             rect=QRect(QPoint(*point),size)
             # Character visibility wins even when a very small screen cannot
@@ -68,8 +85,11 @@ def panel_positions(pet,sizes,area,blockers=(),gap=10):
             return (overlap(rect,pet.adjusted(-gap,-gap,gap,gap)),
                     sum(overlap(rect,other.adjusted(-gap//2,-gap//2,gap//2,gap//2)) for other in occupied),
                     (point[0]-preferred.x())**2+(point[1]-preferred.y())**2,point[1],point[0])
-        point=QPoint(*min(candidates,key=score));placements.append(point)
-        occupied.append(QRect(point,size))
+        point=QPoint(*min(candidates,key=score));slot=QRect(point,size)
+        slots[role]=slot;occupied.append(slot)
+        actual=sizes[role]
+        y=slot.y()+(slot.height()-actual.height())//2 if role==2 else slot.bottom()-actual.height()+1
+        placements[role]=QPoint(slot.x()+(slot.width()-actual.width())//2,y)
     return placements
 
 class QuotaWorker(QThread):
@@ -494,7 +514,7 @@ class Pet(QWidget):
             if self.chat and self.chat.composer.isVisible():self.chat.composer.hide()
         elif self.chat and self.chat.enabled:
             if not self.chat.composer.isVisible():
-                self.chat.composer.show();self.chat.position()
+                self.chat.composer.show();self.chat.position();self.position_bubble()
     def set_auto_hide_fullscreen(self,enabled):
         self.note_interaction()
         self.auto_hide_fullscreen=enabled
@@ -594,8 +614,8 @@ class Pet(QWidget):
             if self.mode=='movement':self.finish_movement();self.play(self.idles[0],'idle')
             self.move(position)
             if self.dragging:self.origin=self.pos();self.press_pos=QCursor.pos()
-        if any(panel.isVisible() for panel in self.panels()):self.position_bubble()
         if self.chat:self.chat.position()
+        if any(panel.isVisible() for panel in self.panels()):self.position_bubble()
     def moveEvent(self,event):
         super().moveEvent(event)
         if getattr(self,'chat',None):self.chat.position()
@@ -773,12 +793,18 @@ class Pet(QWidget):
         try:
             screen=QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
             area=screen.availableGeometry();pet=self.frameGeometry()
-            visible=[panel for panel in self.panels() if panel.isVisible()]
             blockers=[]
             if self.chat and self.chat.enabled and self.chat.composer.isVisible():blockers.append(self.chat.composer.frameGeometry())
-            if self.hover_bar.isVisible():blockers.append(self.hover_bar.frameGeometry())
-            points=panel_positions(pet,[panel.size() for panel in visible],area,blockers)
-            for panel,point in zip(visible,points):panel.move(point)
+            # Reserve the toolbar even while hidden so hovering cannot move a
+            # report that the user is reading.
+            bar_size=self.hover_bar.size()
+            bar_point=clamp_position(QPoint(pet.center().x()-bar_size.width()//2,pet.bottom()+8),bar_size,area)
+            blockers.append(QRect(bar_point,bar_size))
+            scale=getattr(self,'bubble_percent',100)/100
+            defaults=(QSize(round(256*scale),round(140*scale)),QSize(round(300*scale),round(260*scale)),QSize(round(280*scale),round(320*scale)))
+            sizes=[panel.size() if panel.layout.count() else default for panel,default in zip(self.panels(),defaults)]
+            points=panel_positions(pet,sizes,area,blockers,scale=scale)
+            for panel,point in zip(self.panels(),points):panel.move(point)
         finally:self._positioning_panels=False
     def position_hover_bar(self):
         if not self.hover_bar.isVisible():return
@@ -824,6 +850,7 @@ class Pet(QWidget):
         if self.task_bubbles_disabled or self.desktop_hidden():return
         self.task_timer.stop()
         self.task_bubble.task_result(title,text,details);self.position_bubble()
+        self.task_timer.start(30000 if len(text)>180 or len(text.splitlines())>6 else 15000)
     def task_progress(self,title,text,details):
         if self.task_bubbles_disabled or self.desktop_hidden():return
         panel=self.task_bubble;self.task_timer.stop()
@@ -835,6 +862,7 @@ class Pet(QWidget):
         else:
             panel.task_result(title,text,details);panel.is_task_progress=True
         self.position_bubble()
+        self.task_timer.start(15000)
     def task_completed(self,text,details):
         celebration=next((v for v in self.variants if v['id']=='18'),None)
         if celebration and not self.dock_edge:self.play(celebration,'task-celebration')
