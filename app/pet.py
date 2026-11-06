@@ -12,6 +12,7 @@ from quota import read_quota, quota_windows
 from station import DEFAULT_BASE_URL, StationFailure, fetch_station, normalize_base_url
 from version import VERSION
 from movement import plan_movement, movement_fraction
+from panel_layout import layout_panels,hover_position
 
 from platform_support import resource_root,state_root,configure_mac_window
 ROOT=resource_root()
@@ -46,51 +47,8 @@ def format_latency(milliseconds):
 
 
 def panel_positions(pet,sizes,area,blockers=(),gap=10,scale=1.0):
-    """Return speech/report/quota anchors, reserving all three roles even when hidden."""
-    speech_size,report_size,quota_size=sizes
-    # Empty windows have no useful size yet. Stable reservations also keep a
-    # one-line greeting or a short report from moving the other panel anchors.
-    reserved=[QSize(max(speech_size.width(),round(300*scale)),max(speech_size.height(),round(140*scale))),
-              QSize(max(report_size.width(),round(300*scale)),max(report_size.height(),round(260*scale))),
-              QSize(max(quota_size.width(),round(280*scale)),max(quota_size.height(),round(320*scale)))]
-    occupied=[QRect(rect) for rect in blockers]
-    placements=[None]*3;slots={}
-    def overlap(a,b):
-        rect=a.intersected(b)
-        return max(0,rect.width())*max(0,rect.height())
-    # Quota always takes a side first; speech stays near the head, and the
-    # report uses its own area above it (or the nearest clear space at edges).
-    for role in (2,0,1):
-        size=reserved[role]
-        width,height=size.width(),size.height()
-        if role==2:
-            left_space=pet.left()-area.left();right_space=area.right()-pet.right()
-            x=pet.right()+gap+1 if right_space>=left_space else pet.left()-width-gap
-            preferred=QPoint(x,pet.center().y()-height//2)
-        elif role==0:preferred=QPoint(pet.center().x()-width//2,pet.top()-height-gap)
-        else:preferred=QPoint(pet.center().x()-width//2,slots[0].top()-height-gap)
-        xs=[preferred.x(),pet.right()+gap+1,pet.left()-width-gap,area.left(),area.right()-width+1]
-        ys=[preferred.y(),pet.bottom()+gap+1,pet.center().y()-height//2,area.top(),area.bottom()-height+1]
-        for rect in occupied:
-            xs.extend((rect.left()-width-gap,rect.right()+gap+1,rect.left()))
-            ys.extend((rect.top()-height-gap,rect.bottom()+gap+1,rect.top()))
-        candidates={ (point.x(),point.y()) for x in xs for y in ys for point in [clamp_position(QPoint(x,y),size,area)] }
-        if role==2:
-            side_candidates={point for point in candidates if point[0]+width+gap<=pet.left() or point[0]>=pet.right()+gap+1}
-            if side_candidates:candidates=side_candidates
-        def score(point):
-            rect=QRect(QPoint(*point),size)
-            # Character visibility wins even when a very small screen cannot
-            # physically hold all panels without any panel-to-panel overlap.
-            return (overlap(rect,pet.adjusted(-gap,-gap,gap,gap)),
-                    sum(overlap(rect,other.adjusted(-gap//2,-gap//2,gap//2,gap//2)) for other in occupied),
-                    (point[0]-preferred.x())**2+(point[1]-preferred.y())**2,point[1],point[0])
-        point=QPoint(*min(candidates,key=score));slot=QRect(point,size)
-        slots[role]=slot;occupied.append(slot)
-        actual=sizes[role]
-        y=slot.y()+(slot.height()-actual.height())//2 if role==2 else slot.bottom()-actual.height()+1
-        placements[role]=QPoint(slot.x()+(slot.width()-actual.width())//2,y)
-    return placements
+    return layout_panels(pet,sizes,area,blockers,gap,scale)[0]
+
 
 class QuotaWorker(QThread):
     ready=Signal(object)
@@ -160,6 +118,7 @@ class RefreshButton(QPushButton):
 class Bubble(QWidget):
     dismiss_requested=Signal()
     refresh_requested=Signal(str)
+    placement_requested=Signal()
     def __init__(self):
         super().__init__(None, FLAGS)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -201,8 +160,14 @@ class Bubble(QWidget):
         painter.setBrush(Qt.GlobalColor.white);painter.setPen(Qt.GlobalColor.transparent)
         painter.drawRoundedRect(self.rect(),16,16)
     def clear(self):
+        self._updating_content=True;self.setUpdatesEnabled(False)
         while self.layout.count():
             widget=self.layout.takeAt(0).widget();widget.hide();widget.setParent(None);widget.deleteLater()
+    def present(self):
+        # A new native tool window must receive its final position before show;
+        # otherwise Windows paints one frame at its previous/default position.
+        self.set_scale_percent(self.scale_percent);self.layout.activate()
+        self._updating_content=False;self.placement_requested.emit();self.show();self.setUpdatesEnabled(True)
     def label(self,text):
         label=QLabel(text);label.setWordWrap(True);label.setTextFormat(Qt.TextFormat.PlainText)
         if not self.layout.count():label.setContentsMargins(0,0,20,0)
@@ -214,7 +179,7 @@ class Bubble(QWidget):
         self.is_quota_result=False
         self.is_station_result=False
         self.base_width=256;self.setFixedWidth(round(256*self.scale_percent/100))
-        self.clear();self.label(text);self.set_scale_percent(self.scale_percent);self.show()
+        self.clear();self.label(text);self.present()
     def task_result(self,title,text,details):
         self.is_size_preview=False
         self.is_task_bubble=True
@@ -232,7 +197,7 @@ class Bubble(QWidget):
         self.layout.addWidget(result)
         button=QPushButton('详情');button.setStyleSheet('color:#60358c;background:#eee5f7;border:0;border-radius:7px;padding:7px;')
         button.clicked.connect(lambda checked=False:details());self.layout.addWidget(button)
-        self.set_scale_percent(self.scale_percent);self.show()
+        self.present()
     def quota(self,windows):
         self.is_size_preview=False
         self.is_task_bubble=False
@@ -248,7 +213,7 @@ class Bubble(QWidget):
             bar.setValue(round(value) if value is not None else 0);bar.setTextVisible(False);self.layout.addWidget(bar)
             if window['resetsAt']:
                 self.label('重置：'+datetime.fromtimestamp(window['resetsAt']).strftime('%m月%d日 %H:%M'))
-        self.set_scale_percent(self.scale_percent);self.show()
+        self.present()
 
     def _card(self,title,loading=False,provider='station'):
         card=QFrame(self);card.setObjectName('dashboardCard')
@@ -306,14 +271,14 @@ class Bubble(QWidget):
             elif not station and not station_loading:line(card,'尚无查询结果，请打开中转站设置。')
             self.layout.addWidget(card)
         if not show_codex and not show_station:self.label('额度卡片已关闭。右键菜单可重新打开。')
-        self.set_scale_percent(self.scale_percent);self.show()
+        self.present()
 
     def size_preview(self):
         self.clear();self.is_size_preview=True;self.is_task_bubble=False
         self.is_task_progress=False;self.is_quota_result=True;self.base_width=300
         self.is_station_result=False
         blank=QTextBrowser();blank.setProperty('baseHeight',110)
-        self.layout.addWidget(blank);self.set_scale_percent(self.scale_percent);self.show()
+        self.layout.addWidget(blank);self.present()
 
 class Pet(QWidget):
     def __init__(self):
@@ -343,6 +308,7 @@ class Pet(QWidget):
         self.task_bubble.dismiss_requested.connect(self.dismiss_task_bubble)
         self.quota_bubble.dismiss_requested.connect(self.dismiss_quota_bubble)
         self.quota_bubble.refresh_requested.connect(self.refresh_card)
+        for panel in self.panels():panel.placement_requested.connect(self.position_bubble)
         self.chat=None
         self.task_active=False
         self.manual_hidden=False;self.fullscreen_hidden=False;self.hidden_since=None
@@ -798,20 +764,22 @@ class Pet(QWidget):
             # Reserve the toolbar even while hidden so hovering cannot move a
             # report that the user is reading.
             bar_size=self.hover_bar.size()
-            bar_point=clamp_position(QPoint(pet.center().x()-bar_size.width()//2,pet.bottom()+8),bar_size,area)
+            bar_point=hover_position(pet,bar_size,area)
+            if self.hover_bar.isVisible():self.hover_bar.move(bar_point)
             blockers.append(QRect(bar_point,bar_size))
             scale=getattr(self,'bubble_percent',100)/100
-            defaults=(QSize(round(256*scale),round(140*scale)),QSize(round(300*scale),round(260*scale)),QSize(round(280*scale),round(320*scale)))
+            defaults=(QSize(round(256*scale),round(52*scale)),QSize(round(300*scale),round(152*scale)),QSize(round(280*scale),round(146*scale)))
             sizes=[panel.size() if panel.layout.count() else default for panel,default in zip(self.panels(),defaults)]
-            points=panel_positions(pet,sizes,area,blockers,scale=scale)
+            screen_key=(area.x(),area.y(),area.width(),area.height())
+            side=getattr(self,'_panel_side',None) if getattr(self,'_panel_screen',None)==screen_key else None
+            points,self._panel_side=layout_panels(pet,sizes,area,blockers,scale=scale,preferred_side=side)
+            self._panel_screen=screen_key
             for panel,point in zip(self.panels(),points):panel.move(point)
         finally:self._positioning_panels=False
     def position_hover_bar(self):
-        if not self.hover_bar.isVisible():return
         screen=QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
-        area=screen.availableGeometry();size=self.hover_bar.size();pet=self.frameGeometry();gap=8
-        point=QPoint(pet.center().x()-size.width()//2,pet.bottom()+gap)
-        self.hover_bar.move(clamp_position(point,size,area));self.position_bubble()
+        self.hover_bar.move(hover_position(self.frameGeometry(),self.hover_bar.size(),screen.availableGeometry()))
+        self.position_bubble()
     def _keep_hover_bar(self):
         self.hover_hide_timer.stop();self.position_hover_bar()
     def _schedule_hover_bar_hide(self):
@@ -820,7 +788,7 @@ class Pet(QWidget):
         self.hover_hide_timer.stop();self.hover_bar.hide();self.position_bubble()
     def _show_hover_bar(self):
         if self.desktop_hidden() or self.dock_edge:return
-        self.hover_hide_timer.stop();self.hover_bar.show();self.position_hover_bar();self.hover_bar.raise_()
+        self.hover_hide_timer.stop();self.position_hover_bar();self.hover_bar.show();self.hover_bar.raise_()
     def _hover_action(self):
         pool=self.interaction_animations()
         if pool:self.choose(random.choice(pool))
@@ -859,6 +827,7 @@ class Pet(QWidget):
             bottom=bar.value()>=bar.maximum()-8;old=bar.value()
             panel.result_title.setText(title);view.setPlainText(text)
             bar.setValue(bar.maximum() if bottom else min(old,bar.maximum()))
+            panel.present()
         else:
             panel.task_result(title,text,details);panel.is_task_progress=True
         self.position_bubble()
@@ -1218,8 +1187,8 @@ class Pet(QWidget):
             else:position.setY(area.bottom()+1-pixels)
             self.move(position)
         self.settings.setValue('sizePercent',value)
-        if any(panel.isVisible() for panel in self.panels()):self.position_bubble()
         if self.chat:self.chat.position()
+        self.position_bubble()
         self.update()
     def preview_idle(self,item):
         self.note_interaction()
@@ -1448,7 +1417,7 @@ def main():
         QTimer.singleShot(1000,record_startup)
         if '--show-quota' in sys.argv:QTimer.singleShot(1200,pet.quota)
         def record_visibility():
-            (STATE_ROOT/'app/显示诊断.json').write_text(json.dumps({'pid':os.getpid(),'visible':pet.isVisible(),'manualHidden':pet.manual_hidden,'fullscreenHidden':pet.fullscreen_hidden,'trayVisible':pet.tray.isVisible(),'trayAvailable':QSystemTrayIcon.isSystemTrayAvailable(),'syncWatching':pet.desktop_sync.timer.isActive(),'syncActive':len(pet.desktop_sync.running),'syncObserved':len(pet.desktop_sync.known),'platform':QApplication.platformName(),'position':[pet.x(),pet.y()],'windowId':int(pet.winId())},ensure_ascii=False),encoding='utf-8')
+            (STATE_ROOT/'app/显示诊断.json').write_text(json.dumps({'pid':os.getpid(),'visible':pet.isVisible(),'manualHidden':pet.manual_hidden,'fullscreenHidden':pet.fullscreen_hidden,'trayVisible':pet.tray.isVisible(),'trayAvailable':QSystemTrayIcon.isSystemTrayAvailable(),'syncWatching':pet.desktop_sync.timer.isActive(),'syncActive':len(pet.desktop_sync.running),'syncObserved':len(pet.desktop_sync.known),'platform':QApplication.platformName(),'position':[pet.x(),pet.y()],'windowId':int(pet.winId()),'quotaSide':getattr(pet,'_panel_side',None),'panels':{name:{'visible':panel.isVisible(),'rect':[panel.x(),panel.y(),panel.width(),panel.height()]} for name,panel in zip(('speech','report','quota','toolbar'),(*pet.panels(),pet.hover_bar))}},ensure_ascii=False),encoding='utf-8')
         diagnostic_timer=QTimer(pet);diagnostic_timer.setInterval(2000);diagnostic_timer.timeout.connect(record_visibility);diagnostic_timer.start()
         if '--preview' in sys.argv:
             QTimer.singleShot(500,lambda:pet.grab().save(str(STATE_ROOT/'app/桌宠窗口预览.png')))

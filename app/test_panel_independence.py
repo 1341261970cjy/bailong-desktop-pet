@@ -3,7 +3,7 @@ os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import unittest
 from unittest.mock import Mock
 
-from PySide6.QtCore import QTimer,QRect,QSize
+from PySide6.QtCore import QTimer,QRect,QSize,QObject,QEvent
 from PySide6.QtWidgets import QApplication,QWidget,QLabel
 from PySide6.QtTest import QTest
 from pet import Bubble,Pet,format_money,panel_positions
@@ -36,6 +36,7 @@ class PanelHarness(QWidget):
         self.quota_timer=QTimer(self);self.quota_timer.setSingleShot(True);self.quota_timer.timeout.connect(self.dismiss_quota_bubble)
         self.task_bubble.dismiss_requested.connect(self.dismiss_task_bubble)
         self.quota_bubble.dismiss_requested.connect(self.dismiss_quota_bubble)
+        for panel in self.panels():panel.placement_requested.connect(self.position_bubble)
         self.dashboard_requested=False;self.current_quota_windows=None
         self.station_snapshot=None;self.station_error=None;self.quota_error=None
         self.show_codex_panel=False;self.show_station_panel=True
@@ -68,6 +69,24 @@ class IndependentPanelsTests(unittest.TestCase):
         self.assertEqual(result_view.toPlainText(),'已完成的报告不能被互动替换')
         self.assertTrue(p.task_timer.isActive())
         self.assertEqual(p.task_timer.interval(),15000)
+
+    def test_first_native_show_already_has_the_final_nonoverlapping_position(self):
+        p=self.pet
+        class FirstShow(QObject):
+            def __init__(self):super().__init__();self.rectangles={}
+            def eventFilter(self,watched,event):
+                if event.type()==QEvent.Type.Show:self.rectangles[watched]=QRect(watched.frameGeometry())
+                return False
+        observer=FirstShow()
+        for panel in p.panels():
+            panel.move(p.pos());panel.installEventFilter(observer)
+        p.say('互动',0);p.task_result('完成','简短汇报',lambda:None)
+        p.station_snapshot={'walletBalance':'12','todayUsed':'0'}
+        p.dashboard_requested=True;p._render_dashboard()
+        self.assertEqual(len(observer.rectangles),3)
+        for panel,first_rect in observer.rectangles.items():
+            self.assertEqual(first_rect,panel.frameGeometry())
+            self.assertFalse(first_rect.intersects(p.frameGeometry()))
 
     def test_completed_reports_have_readable_independent_expiry(self):
         p=self.pet
