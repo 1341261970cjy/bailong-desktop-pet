@@ -5,8 +5,19 @@ from pathlib import Path
 
 def resource_root():
     if not getattr(sys,'frozen',False):return Path(__file__).resolve().parents[1]
-    executable=Path(sys.executable).resolve()
-    return executable.parents[1]/'Resources' if sys.platform=='darwin' else executable.parent
+    # PyInstaller may preserve the original build location in ``resolve()``
+    # when a finished onedir tree is copied elsewhere. Prefer the actual
+    # executable directory and only use the resolved path as a fallback.
+    executable=Path(sys.executable).absolute()
+    if sys.platform=='darwin':
+        return executable.parent.parent/'Resources'
+    candidates=[executable.parent]
+    resolved=Path(sys.executable).resolve().parent
+    if resolved not in candidates:candidates.append(resolved)
+    for candidate in candidates:
+        if (candidate/'outputs'/'白龙桌宠素材'/'素材清单.json').is_file():
+            return candidate
+    return executable.parent
 
 def user_data():
     if os.environ.get('BAILONG_DATA_DIR'):return Path(os.environ['BAILONG_DATA_DIR'])

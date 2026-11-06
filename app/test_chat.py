@@ -85,7 +85,7 @@ class ChatUiTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def tearDown(self):
-        self.controller.hide();self.controller.window.hide();self.pet.bubble.hide()
+        self.controller.hide();self.controller.window.hide();self.pet.bubble.hide();self.pet.task_bubble.hide();self.pet.quota_bubble.hide()
 
     def test_menu_submenus_and_idle_preview(self):
         menu=self.pet.context_menu();actions={a.text():a for a in menu.actions()}
@@ -112,9 +112,9 @@ class ChatUiTests(unittest.TestCase):
         chat['turns'].append(turn);c.active=chat;c.running_chat=chat;c.running_turn=turn
         c.completed({'threadId':'x','text':text,'transcript':text})
         app.processEvents()
-        labels=self.pet.bubble.findChildren(QLabel)
+        labels=self.pet.task_bubble.findChildren(QLabel)
         self.assertEqual(labels[0].text(),'主人，完成啦！')
-        buttons=[b for b in self.pet.bubble.findChildren(QPushButton) if b.text()=='详情']
+        buttons=[b for b in self.pet.task_bubble.findChildren(QPushButton) if b.text()=='详情']
         self.assertEqual(len(buttons),1);buttons[0].click()
         self.assertTrue(c.window.isVisible());self.assertIn(text.strip(),c.window.view.toPlainText())
         self.assertEqual(HistoryStore(self.temp.name).conversations[-1]['turns'][-1]['result'],text)
@@ -125,7 +125,7 @@ class ChatUiTests(unittest.TestCase):
         chat['turns'].append(turn);c.active=chat;c.running_chat=chat;c.running_turn=turn
         c.failed('模拟连接中断',False)
         self.assertEqual(turn['status'],'failed')
-        self.assertNotIn('任务完成啦',self.pet.bubble.findChildren(QLabel)[0].text())
+        self.assertNotIn('任务完成啦',self.pet.task_bubble.findChildren(QLabel)[0].text())
 
     def test_close_history_keeps_pet_and_draft(self):
         c=self.controller;c.open_history();c.window.editor.setPlainText('未发送的草稿')

@@ -5,6 +5,8 @@ import unittest
 import time
 from unittest.mock import patch
 from PySide6.QtWidgets import QApplication,QTextBrowser,QPushButton
+from PySide6.QtCore import Qt,QPoint
+from PySide6.QtTest import QTest
 from chat_backend import CodexSession
 from chat_ui import ChatController
 from pet import Pet
@@ -36,19 +38,25 @@ class UiTests(unittest.TestCase):
         p.play(p.work_slots[1],'working')
         c.receive('summary_update','正在核对主人的需求。');c.preview_reply();c.render()
         self.assertIn('思考摘要（公开）',c.window.view.toPlainText())
-        self.assertTrue(p.bubble.isVisible())
-        self.assertTrue(p.bubble.is_task_progress)
+        self.assertTrue(p.task_bubble.isVisible())
+        self.assertTrue(p.task_bubble.is_task_progress)
         long='完整任务结果\n'*100
         result={'threadId':'test','text':long,'transcript':long}
         with patch.object(p,'play_click_sound') as sound:
             c.completed(result);c.completed(result)
-            sound.assert_called_once()
+            sound.assert_not_called()
         self.assertEqual(p.mode,'task-celebration');self.assertEqual(p.current['id'],'18')
-        view=p.bubble.findChild(QTextBrowser);self.assertEqual(view.toPlainText(),long)
+        view=p.task_bubble.findChild(QTextBrowser);self.assertEqual(view.toPlainText(),long)
         app.processEvents();self.assertGreater(view.verticalScrollBar().maximum(),0)
-        button=next(b for b in p.bubble.findChildren(QPushButton) if b.text()=='详情')
+        button=next(b for b in p.task_bubble.findChildren(QPushButton) if b.text()=='详情')
         button.click();self.assertTrue(c.window.isVisible())
         p.started=time.monotonic()-5;p.animate();self.assertEqual(p.mode,'idle')
+    def test_one_mouse_click_plays_one_sound_without_delayed_replay(self):
+        p=self.pet;p.click_timer.stop();p.last_click=None;p.dock_edge=None
+        with patch.object(p,'play_click_sound') as sound:
+            QTest.mouseClick(p,Qt.MouseButton.LeftButton,pos=QPoint(p.width()//2,p.height()//2))
+            QTest.qWait(320);sound.assert_called_once()
+            QTest.qWait(400);sound.assert_called_once()
     def test_failure_has_no_success_sound_or_animation(self):
         c=self.c;p=self.pet
         c.active=c.store.new(self.temp.name);c.running_chat=c.active

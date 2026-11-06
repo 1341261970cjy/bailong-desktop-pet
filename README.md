@@ -1,30 +1,69 @@
-# GPT白龙娘动态桌宠 v0.5.1
+# 白龙桌宠 · 定制更新版源码
 
-Windows轻量版：自移动、吸边探头、大小调节、Codex公开任务进展提醒，35段透明WebM动画。
+基于白龙桌宠 v0.5.1 WebM 版，增加聊天界面调整、DogAPI 钱包与今日消耗查询、独立提示面板和本地声音导入。保留 35 段透明动画、自移动、吸边、大小调节与 Codex 公开任务提醒。
 
-普通使用者请到[发布页](https://github.com/jingh12312-rgb/bailong-desktop-pet/releases/tag/v0.5.1)下载 `bailong-desktop-pet-v0.5.1-windows-x64-webm.zip`，全部解压后双击 `BailongPet.exe`。
+- 当前仓库：[1341261970cjy/bailong-desktop-pet](https://github.com/1341261970cjy/bailong-desktop-pet)
+- 普通操作与配置：[使用说明](使用说明.md)
+- 环境、测试与打包：[开发说明](DEVELOPMENT.md)
+- 本次修改：[更新记录](RELEASE_NOTES.md)
 
-## 开发者运行
+**本次更新提供源码，尚未发布新的定制版 GitHub Release。** GitHub 的“Code → Download ZIP”是源码包，不能直接双击运行。原作者 v0.5.1 的旧 EXE 不包含这里后续的定制功能。
 
-此仓库提供v0.5.1轻量版源码；动画素材和Windows解码器随上述完整发布包提供，没有纳入Git历史。
+## 本次功能
 
-1. 安装64位Python（当前构建使用Python 3.13）。
-2. 在源码目录执行 `python -m pip install -r requirements.txt`。
-3. 从完整Windows发布包复制整个 `outputs` 和 `tools` 文件夹到源码根目录，与 `app` 并列。保留全部35段WebM及素材清单。
-4. 执行 `python app/pet.py`；自检执行 `python app/pet.py --self-test`。
+- 鼠标悬停显示“聊天 / 额度 / 声音 / ⋯”，更多选项集中在右键菜单。
+- 聊天窗口采用紫白圆角界面、自定义最小化/最大化/关闭按钮，支持会话列表、新建、任务目录与本机历史。
+- 额度面板采用紧凑布局和更易读的字体，金额保留三位小数，不显示更新时间。标题右侧的圆圈用于刷新，查询时转动，不另占一行提示。增加最近调用的首字等待与总耗时参考。
+- Codex 与 DogAPI 卡片可分别开关；额度、互动台词、工作汇报分别显示，互动不覆盖额度和工作汇报，提示尽量避开桌宠。
+- DogAPI 显示账户钱包余额和今日消耗，移除累计消费及 Key 剩余额度。
+- 声音每次点击只播放一遍，任务完成不会额外触发点击声；支持试听、静音及本地音频导入。
+- 修复 Windows 打包时 HTTPS 运行库和证书策略文件缺失导致的额度查询失败。
 
-程序通过FFmpeg的libvpx-vp9解码透明通道，保留动作预加载；请不要用丢弃透明通道的默认VP9解码方式替换。
+## 运行当前源码
 
-## 构建Windows包
+当前验证环境为 Windows x64、Python **3.12.14**。
 
-在Windows上安装PyInstaller 6.22.3至 `.build-tools`：`python -m pip install --target .build-tools pyinstaller==6.22.3`。
+1. 安装 64 位 Python，在项目目录建立环境并安装依赖：
 
-运行 `python work/build_windows.py` 生成EXE。重新整理完整ZIP使用 `python work/build_release.py`，需要先将FFmpeg放在 `work/video-deps/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe`（可从完整包的tools/ffmpeg.exe复制），并保留outputs素材。脚本会生成带运行库、解码器及素材的发布包。
+   ```powershell
+   python -m venv .venv
+   .venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
 
-## 说明
+2. 从[原作者 v0.5.1 完整 WebM 发布包](https://github.com/jingh12312-rgb/bailong-desktop-pet/releases/tag/v0.5.1)复制整个 `outputs` 和 `tools` 文件夹到项目根目录，与 `app` 并列。需要全部动画、素材清单和 `tools/ffmpeg.exe`；这些大文件未纳入 Git。
+3. 启动：
 
-没有Codex也能使用普通桌宠功能。额度、对话与任务同步需要使用者自己的Codex安装和登录。仓库不包含账号、密钥、个人聊天记录。
+   ```powershell
+   .venv\Scripts\python.exe app\pet.py
+   ```
 
-macOS适配源码尚未完成Mac实机验收，不提供已验证Mac安装包。当前Mac构建脚本仍需补齐FFmpeg打包，请勿将其当作可直接发布的构建流程。
+完整 Windows 包自带 Python 和 Qt，但需要自行构建或等待对应定制版本的正式发布。构建步骤见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
-源码尚未指定开源许可证；公开源码不代表授予任意使用或再分发许可。美术素材说明见ASSETS.md，运行库遵循各自许可证。本项目非OpenAI官方产品。
+## DogAPI 配置
+
+右键桌宠 →“中转站设置…”，地址填写 `https://www.dogapi.cc`。
+
+| 数据 | 所需设置 |
+| --- | --- |
+| 钱包余额 | 模型调用 API Key，通常以 `sk-` 开头 |
+| 完整今日消耗 | 另外填写网站用户 Access Token 与数字账号 ID |
+
+账号 ID 位于网站个人资料姓名旁；用户令牌位于个人资料 → Security（安全）→ Access Token。**网站打开 Access Token 项会重新生成令牌，可能使旧令牌失效。**
+
+今日消耗读取日志的完整统计接口，按北京时间（Asia/Shanghai）当天 00:00 至查询时刻汇总。普通 API Key 的最近 1000 条日志不足以保证全天完整，程序不会将累计金额或截断记录当成今日总额。未配置账单权限时会提示，钱包可单独查询。DogAPI 开启时每分钟刷新，也可手动刷新。
+
+凭据只填写并保存在本机设置，勿写入源码、聊天或 GitHub。
+
+## 声音与个人数据
+
+公开仓库只提供原点击声，支持从“声音 → 添加或更换本地音效…”导入 WAV、MP3、OGG、FLAC。个人导入的爱给网小黄鸭和其他个人音频不随 Git 公开。
+
+当前 Windows 导入音频保存到 `D:\CodexDragonBuild\UserData\sounds`；D 盘不可用时会提示。聊天历史、API Key、账单访问令牌和运行诊断不属于公开源码。
+
+## 适用范围
+
+没有 Codex 也能使用普通动画、移动和吸边。聊天、Codex 官方额度及任务同步需要使用者自己的 Codex 安装与登录；DogAPI 使用独立的站点凭据。
+
+macOS 适配源码尚未完成实机验收，不提供已验证的 Mac 安装包；Linux、32 位 Windows 和 Windows ARM 未验证。
+
+本项目非 OpenAI 官方产品。源码尚未指定开源许可证，美术素材说明见 [ASSETS.md](ASSETS.md)，运行库遵循各自许可证。

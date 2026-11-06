@@ -1,13 +1,15 @@
 import json, random, sys, time, threading, gzip, os
 from pathlib import Path
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime,timezone,timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from PIL import Image
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QEvent
-from PySide6.QtGui import QImage, QPixmap, QPainter, QRegion, QCursor, QIcon, QTransform
-from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QProgressBar, QMenu, QMessageBox, QProgressDialog, QPushButton, QSystemTrayIcon, QTextBrowser, QSlider, QDialog, QCheckBox
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QEvent, QProcess
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QRegion, QCursor, QIcon, QTransform
+from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QProgressBar, QMenu, QMessageBox, QProgressDialog, QPushButton, QSystemTrayIcon, QTextBrowser, QSlider, QDialog, QCheckBox, QLineEdit, QFormLayout, QDialogButtonBox, QHBoxLayout, QFrame, QFileDialog
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from quota import read_quota, quota_windows
+from station import DEFAULT_BASE_URL, StationFailure, fetch_station, normalize_base_url
 from version import VERSION
 from movement import plan_movement, movement_fraction
 
@@ -24,6 +26,52 @@ def clamp_position(position,size,area):
     return QPoint(max(area.left(),min(position.x(),max_x)),
                   max(area.top(),min(position.y(),max_y)))
 
+def format_money(value,currency=''):
+    """Round display amounts only; keep the original snapshot for calculations."""
+    if value is None:return '—'
+    try:
+        number=Decimal(str(value))
+        if not number.is_finite():return '—'
+        return currency+format(number.quantize(Decimal('0.001'),rounding=ROUND_HALF_UP),'.3f')
+    except (InvalidOperation,ValueError,TypeError):return '—'
+
+
+def format_latency(milliseconds):
+    if milliseconds is None or isinstance(milliseconds,bool):return None
+    try:
+        value=Decimal(str(milliseconds))
+        if not value.is_finite() or value<0:return None
+        return format((value/1000).quantize(Decimal('0.1'),rounding=ROUND_HALF_UP),'.1f')+'s'
+    except (InvalidOperation,ValueError,TypeError):return None
+
+
+def panel_positions(pet,sizes,area,blockers=(),gap=10):
+    """Place each floating panel near the pet while reserving other surfaces."""
+    occupied=[QRect(rect) for rect in blockers]
+    placements=[]
+    def overlap(a,b):
+        rect=a.intersected(b)
+        return max(0,rect.width())*max(0,rect.height())
+    for size in sizes:
+        width,height=size.width(),size.height()
+        preferred=QPoint(pet.center().x()-width//2,pet.top()-height-gap)
+        xs=[preferred.x(),pet.right()+gap+1,pet.left()-width-gap,area.left(),area.right()-width+1]
+        ys=[preferred.y(),pet.bottom()+gap+1,pet.center().y()-height//2,area.top(),area.bottom()-height+1]
+        for rect in occupied:
+            xs.extend((rect.left()-width-gap,rect.right()+gap+1,rect.left()))
+            ys.extend((rect.top()-height-gap,rect.bottom()+gap+1,rect.top()))
+        candidates={ (point.x(),point.y()) for x in xs for y in ys for point in [clamp_position(QPoint(x,y),size,area)] }
+        def score(point):
+            rect=QRect(QPoint(*point),size)
+            # Character visibility wins even when a very small screen cannot
+            # physically hold all panels without any panel-to-panel overlap.
+            return (overlap(rect,pet.adjusted(-gap,-gap,gap,gap)),
+                    sum(overlap(rect,other.adjusted(-gap//2,-gap//2,gap//2,gap//2)) for other in occupied),
+                    (point[0]-preferred.x())**2+(point[1]-preferred.y())**2,point[1],point[0])
+        point=QPoint(*min(candidates,key=score));placements.append(point)
+        occupied.append(QRect(point,size))
+    return placements
+
 class QuotaWorker(QThread):
     ready=Signal(object)
     failed=Signal(str)
@@ -33,13 +81,71 @@ class QuotaWorker(QThread):
         try: self.ready.emit(quota_windows(read_quota(cancel=self.cancel)))
         except Exception as error: self.failed.emit(str(error))
 
+class StationWorker(QThread):
+    ready=Signal(object)
+    failed=Signal(str)
+    def __init__(self,api_key,base_url,parent=None,billing_access_token='',account_id=''):
+        super().__init__(parent);self.api_key=api_key;self.base_url=base_url;self.billing_access_token=billing_access_token;self.account_id=account_id;self.cancel=threading.Event()
+    def run(self):
+        try:
+            if self.cancel.is_set():return
+            self.ready.emit(fetch_station(self.api_key,self.base_url,billing_access_token=self.billing_access_token,account_id=self.account_id))
+        except Exception as error:self.failed.emit(str(error))
+
+class HoverBar(QWidget):
+    entered=Signal()
+    left=Signal()
+    def __init__(self):
+        super().__init__(None, FLAGS)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setMouseTracking(True)
+        self.layout=QHBoxLayout(self);self.layout.setContentsMargins(10,6,10,6);self.layout.setSpacing(4)
+        self.setStyleSheet('QPushButton { color:#60358c; background:#fbf9ff; border:0; border-radius:9px; padding:5px 9px; font-size:11px; } QPushButton:hover { background:#eadff5; }')
+        for text in ('聊天','额度','声音','⋯'):
+            button=QPushButton(text,self);button.setCursor(Qt.CursorShape.PointingHandCursor);self.layout.addWidget(button)
+            setattr(self,'more_button' if text=='⋯' else text,button)
+        self.adjustSize()
+    def enterEvent(self,event):
+        self.entered.emit();super().enterEvent(event)
+    def leaveEvent(self,event):
+        self.left.emit();super().leaveEvent(event)
+
+class RefreshButton(QPushButton):
+    def __init__(self,loading=False,parent=None):
+        super().__init__('',parent)
+        self.setProperty('isRefresh',True);self.setProperty('loading',bool(loading))
+        self.loading=bool(loading);self.angle=0;self.setFixedSize(24,24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor);self.setEnabled(not self.loading)
+        self.setToolTip('正在刷新…' if self.loading else '刷新')
+        self.timer=QTimer(self);self.timer.setInterval(60);self.timer.timeout.connect(self.advance)
+        if self.loading:self.timer.start()
+    def advance(self):
+        self.angle=(self.angle+24)%360;self.update()
+    def hideEvent(self,event):
+        self.timer.stop();super().hideEvent(event)
+    def showEvent(self,event):
+        if self.loading:self.timer.start()
+        super().showEvent(event)
+    def paintEvent(self,event):
+        super().paintEvent(event)
+        painter=QPainter(self);painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen=QPen(QColor('#9a7ab3'),2.2);pen.setCapStyle(Qt.PenCapStyle.RoundCap);painter.setPen(pen)
+        if self.loading:painter.drawArc(QRectF(5,5,self.width()-10,self.height()-10),-self.angle*16,270*16)
+        else:
+            painter.drawArc(QRectF(5,5,self.width()-10,self.height()-10),45*16,285*16)
+            painter.drawLine(QPointF(18,16),QPointF(13,16));painter.drawLine(QPointF(18,16),QPointF(18,21))
+
+
 class Bubble(QWidget):
     dismiss_requested=Signal()
+    refresh_requested=Signal(str)
     def __init__(self):
         super().__init__(None, FLAGS)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.scale_percent=100;self.base_width=256;self.is_task_bubble=False;self.is_size_preview=False
+        self.is_station_result=False
         self.layout=QVBoxLayout(self); self.layout.setContentsMargins(13,10,13,10);self.layout.setSpacing(5)
         self.setFixedWidth(256)
         self.setStyleSheet('QLabel {color:#332644;font-size:12px;font-family:"Microsoft YaHei","Segoe UI";} QProgressBar {background:#eee8f5;border:1px solid #c8b5dc;border-radius:7px;height:14px;} QProgressBar::chunk {background:#a47bc9;border-radius:6px;}')
@@ -64,7 +170,9 @@ class Bubble(QWidget):
         if self.layout.count() and isinstance(self.layout.itemAt(0).widget(),QLabel):
             self.layout.itemAt(0).widget().setContentsMargins(0,0,self.close_button.width()+4,0)
         for button in self.findChildren(QPushButton):
-            if button is not self.close_button:
+            if button.property('isRefresh'):
+                button.setStyleSheet('QPushButton {color:#8d6ca6;background:transparent;border:0;border-radius:8px;padding:0;font-size:20px;} QPushButton:hover {background:#eee5f7;}')
+            elif button is not self.close_button:
                 button.setStyleSheet(f'color:#60358c;background:#eee5f7;border:0;border-radius:7px;padding:{max(3,round(7*s))}px;')
         self.close_button.setStyleSheet(f'QPushButton {{color:#776783;background:transparent;border:0;border-radius:8px;font-size:{max(12,round(19*s))}px;}} QPushButton:hover {{background:#eee5f7;color:#503768;}}')
         self.adjustSize();self.close_button.move(self.width()-self.close_button.width()-5,5);self.close_button.raise_()
@@ -84,6 +192,7 @@ class Bubble(QWidget):
         self.is_task_bubble=False
         self.is_task_progress=False
         self.is_quota_result=False
+        self.is_station_result=False
         self.base_width=256;self.setFixedWidth(round(256*self.scale_percent/100))
         self.clear();self.label(text);self.set_scale_percent(self.scale_percent);self.show()
     def task_result(self,title,text,details):
@@ -91,6 +200,7 @@ class Bubble(QWidget):
         self.is_task_bubble=True
         self.is_task_progress=False
         self.is_quota_result=True
+        self.is_station_result=False
         self.base_width=300;self.setFixedWidth(round(300*self.scale_percent/100))
         self.clear();self.label(title)
         self.result_title=self.layout.itemAt(0).widget()
@@ -108,6 +218,7 @@ class Bubble(QWidget):
         self.is_task_bubble=False
         self.is_task_progress=False
         self.is_quota_result=True
+        self.is_station_result=False
         self.base_width=256;self.setFixedWidth(round(256*self.scale_percent/100))
         self.clear();self.label('Codex 剩余额度')
         for window in windows:
@@ -119,9 +230,68 @@ class Bubble(QWidget):
                 self.label('重置：'+datetime.fromtimestamp(window['resetsAt']).strftime('%m月%d日 %H:%M'))
         self.set_scale_percent(self.scale_percent);self.show()
 
+    def _card(self,title,loading=False,provider='station'):
+        card=QFrame(self);card.setObjectName('dashboardCard')
+        card.setStyleSheet('#dashboardCard {background:#fbf9ff;border:1px solid #eadff5;border-radius:11px;}')
+        layout=QVBoxLayout(card);layout.setContentsMargins(10,8,10,8);layout.setSpacing(4)
+        heading=QLabel(title,card)
+        heading.setStyleSheet('font-size:14px;font-weight:700;color:#503768;')
+        header=QHBoxLayout();header.setSpacing(4);header.addWidget(heading,1)
+        refresh=RefreshButton(loading,card);refresh.setObjectName('refreshStation' if provider=='station' else 'refreshCodex')
+        refresh.setAccessibleName('刷新 '+title);refresh.clicked.connect(lambda checked=False:self.refresh_requested.emit(provider))
+        header.addWidget(refresh)
+        if not self.layout.count():header.addSpacing(24)
+        layout.addLayout(header)
+        return card,layout
+
+    def dashboard(self,windows,station=None,station_error=None,show_codex=True,show_station=True,codex_error=None,codex_loading=False,station_loading=False):
+        """Compact values and actionable errors, without decorative metadata."""
+        self.is_size_preview=False;self.is_task_bubble=False;self.is_task_progress=False
+        self.is_quota_result=True;self.is_station_result=True;self.base_width=280
+        self.clear();self.close_button.setToolTip('关闭额度面板')
+        def line(card,text,error=False):
+            label=QLabel(text,card);label.setWordWrap(True);label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setStyleSheet('font-size:13px;color:'+('#a34c67' if error else '#5d496e')+';')
+            card.layout().addWidget(label)
+        if show_codex:
+            codex,_=self._card('Codex 额度',codex_loading,'codex')
+            for window in windows or []:
+                value=window.get('remaining');name=window.get('name','额度窗口')
+                line(codex,f'{name}  '+(f'{value:g}%' if value is not None else '暂未提供'))
+                bar=QProgressBar(codex);bar.setRange(0,100);bar.setValue(round(value) if value is not None else 0)
+                bar.setTextVisible(False);bar.setFixedHeight(6);codex.layout().addWidget(bar)
+            if codex_error:line(codex,('刷新失败，保留上次结果。\n' if windows else '')+'Codex 额度查询失败：'+codex_error,True)
+            elif not windows and not codex_loading:line(codex,'当前未返回官方额度。')
+            self.layout.addWidget(codex)
+        if show_station:
+            card,_=self._card('DogAPI',station_loading,'station')
+            if station:
+                currency=station.get('currency') or ''
+                today=station.get('todayUsed')
+                today_date=datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
+                stale_day=station.get('todayDate') not in (None,today_date)
+                if stale_day:today=None
+                for name,value in (('钱包余额',station.get('walletBalance')),('今日消耗',today)):
+                    value_label=QLabel(name+'：'+format_money(value,currency),card)
+                    value_label.setStyleSheet('font-size:14px;color:#503768;');card.layout().addWidget(value_label)
+                if today is None:
+                    detail=('今日统计尚未更新，请刷新。' if stale_day else station.get('todayError'))
+                    if detail:line(card,detail)
+                first=format_latency(station.get('latencyFirstTokenMs'));total=format_latency(station.get('latencyTotalMs'))
+                times=[]
+                if first is not None:times.append('首字≈'+first)
+                if total is not None:times.append('总耗时≈'+total)
+                line(card,'最近调用  '+' · '.join(times) if times else '调用耗时：暂未提供')
+            if station_error:line(card,('刷新失败，保留上次结果。\n' if station else '')+station_error,True)
+            elif not station and not station_loading:line(card,'尚无查询结果，请打开中转站设置。')
+            self.layout.addWidget(card)
+        if not show_codex and not show_station:self.label('额度卡片已关闭。右键菜单可重新打开。')
+        self.set_scale_percent(self.scale_percent);self.show()
+
     def size_preview(self):
         self.clear();self.is_size_preview=True;self.is_task_bubble=False
         self.is_task_progress=False;self.is_quota_result=True;self.base_width=300
+        self.is_station_result=False
         blank=QTextBrowser();blank.setProperty('baseHeight',110)
         self.layout.addWidget(blank);self.set_scale_percent(self.scale_percent);self.show()
 
@@ -139,8 +309,20 @@ class Pet(QWidget):
         self.cache=OrderedDict();self.pinned_frames={};self.frames=[];self.current=None;self.mode='idle';self.index=0
         self.frame_size=min(512,max(256,round(256*max(s.devicePixelRatio() for s in QApplication.screens()))))
         self.transition=None
-        self.bubble=Bubble();self.generation=0;self.worker=None;self.quota_inflight=False;self.dragging=False;self.last_click=None
+        self.bubble=Bubble();self.task_bubble=Bubble();self.quota_bubble=Bubble();self.generation=0;self.quota_generation=0;self.dashboard_requested=False;self.worker=None;self.quota_inflight=False;self.quota_error=None;self.station_worker=None;self.station_inflight=False;self.station_snapshot=None;self.station_error=None;self.station_request_context=None;self.station_snapshot_context=None;self.current_quota_windows=None;self.dragging=False;self.last_click=None
+        self.setMouseTracking(True)
+        self.hover_bar=HoverBar()
+        self.hover_bar.entered.connect(self._keep_hover_bar)
+        self.hover_bar.left.connect(self._schedule_hover_bar_hide)
+        self.hover_hide_timer=QTimer(self);self.hover_hide_timer.setSingleShot(True);self.hover_hide_timer.setInterval(650);self.hover_hide_timer.timeout.connect(self._hide_hover_bar)
+        self.hover_bar.聊天.clicked.connect(self.open_history)
+        self.hover_bar.额度.clicked.connect(self.quota)
+        self.hover_bar.声音.clicked.connect(self.show_sound_menu)
+        self.hover_bar.more_button.clicked.connect(self.show_hover_menu)
         self.bubble.dismiss_requested.connect(self.dismiss_bubble)
+        self.task_bubble.dismiss_requested.connect(self.dismiss_task_bubble)
+        self.quota_bubble.dismiss_requested.connect(self.dismiss_quota_bubble)
+        self.quota_bubble.refresh_requested.connect(self.refresh_card)
         self.chat=None
         self.task_active=False
         self.manual_hidden=False;self.fullscreen_hidden=False;self.hidden_since=None
@@ -148,7 +330,17 @@ class Pet(QWidget):
         self.bubble_percent=max(50,min(150,self.settings.value('bubblePercent',100,type=int)))
         self.task_bubbles_disabled=self.settings.value('taskBubblesDisabled',False,type=bool)
         self.sound_disabled=self.settings.value('soundDisabled',False,type=bool)
-        self.bubble.set_scale_percent(self.bubble_percent)
+        default_sound='duck' if (ROOT/'app/sounds/duck_squeak.wav').is_file() else 'click'
+        self.sound_mode=str(self.settings.value('soundMode',default_sound)).strip() or default_sound
+        self.sound_path=str(self.settings.value('soundPath','')).strip()
+        self.sound_name=str(self.settings.value('soundName','')).strip()
+        self.sound_import=None
+        if self.sound_mode not in ('click','duck','custom') and self.sound_mode not in self._sound_presets():self.sound_mode=default_sound
+        if self.sound_mode=='duck' and default_sound=='click':self.sound_mode='click'
+        self._update_sound_button()
+        self.show_codex_panel=self.settings.value('showCodexPanel',True,type=bool)
+        self.show_station_panel=self.settings.value('showStationPanel',True,type=bool)
+        for panel in self.panels():panel.set_scale_percent(self.bubble_percent)
         self.size_percent=max(50,min(200,self.settings.value('sizePercent',100,type=int)))
         pixels=round(256*self.size_percent/100);self.setFixedSize(pixels,pixels)
         self.auto_hide_fullscreen=self.settings.value('autoHideFullscreen',True,type=bool)
@@ -164,6 +356,9 @@ class Pet(QWidget):
         self.dock_click_timer.timeout.connect(self.begin_undock)
         self.dock_double_click=False
         self.bubble_timer=QTimer(self);self.bubble_timer.setSingleShot(True);self.bubble_timer.timeout.connect(self.dismiss_bubble)
+        self.task_timer=QTimer(self);self.task_timer.setSingleShot(True);self.task_timer.timeout.connect(self.dismiss_task_bubble)
+        self.quota_timer=QTimer(self);self.quota_timer.setSingleShot(True);self.quota_timer.timeout.connect(self.dismiss_quota_bubble)
+        self.station_timer=QTimer(self);self.station_timer.setInterval(60000);self.station_timer.timeout.connect(self.refresh_station_silently);self.station_timer.start()
         self.tick=QTimer(self);self.tick.setTimerType(Qt.TimerType.PreciseTimer);self.tick.setInterval(16);self.tick.timeout.connect(self.animate)
         area=QApplication.primaryScreen().availableGeometry()
         self.move(self.constrained_position(QPoint(area.right()-360,area.bottom()-340)))
@@ -223,7 +418,7 @@ class Pet(QWidget):
     def eventFilter(self,obj,event):
         if event.type() in (QEvent.Type.MouseButtonPress,QEvent.Type.MouseButtonRelease,
                             QEvent.Type.MouseMove,QEvent.Type.KeyPress,QEvent.Type.Wheel):
-            roots=[self,self.bubble]
+            roots=[self,*self.panels()]
             if self.chat:roots.extend((self.chat.composer,self.chat.window))
             owned=isinstance(obj,QWidget) and any(obj is root or root.isAncestorOf(obj) for root in roots)
             if owned:self.note_interaction(cancel_movement=False)
@@ -285,7 +480,7 @@ class Pet(QWidget):
         position=QPoint(round(origin.x()+(target.x()-origin.x())*fraction),
                         round(origin.y()+(target.y()-origin.y())*fraction))
         self.move(self.constrained_position(position))
-        if self.bubble.isVisible():self.position_bubble()
+        if any(panel.isVisible() for panel in self.panels()):self.position_bubble()
     def desktop_hidden(self):
         return self.manual_hidden or self.fullscreen_hidden
     def dialogue_hidden(self):
@@ -293,9 +488,9 @@ class Pet(QWidget):
     def speech_hidden(self):
         return self.desktop_hidden() or (self.mode=='working' and self.current and self.current.get('id','').startswith('work'))
     def sync_dialogue_visibility(self):
-        if self.speech_hidden() and not getattr(self.bubble,'is_task_progress',False) and not self.bubble.is_size_preview and self.bubble.isVisible():self.bubble.hide()
+        if self.speech_hidden() and not self.bubble.is_size_preview and self.bubble.isVisible():self.bubble.hide()
         if self.dialogue_hidden():
-            if self.bubble.isVisible():self.bubble.hide()
+            for panel in self.panels():panel.hide()
             if self.chat and self.chat.composer.isVisible():self.chat.composer.hide()
         elif self.chat and self.chat.enabled:
             if not self.chat.composer.isVisible():
@@ -321,12 +516,16 @@ class Pet(QWidget):
             self.dock_click_timer.stop()
             self.tick.stop();self.click_timer.stop();self.last_click=None;self.dragging=False
             self.pointer_down=False
-            self.hide();self.bubble.hide()
+            self.hide()
+            self._restore_panels=list(dict.fromkeys(getattr(self,'_restore_panels',[])+[panel for panel in self.panels() if panel.isVisible()]))
+            for panel in self.panels():panel.hide()
             if self.chat:self.chat.composer.hide()
         else:
             if self.hidden_since is not None:
                 self.started+=time.monotonic()-self.hidden_since;self.hidden_since=None
             self.ensure_on_screen();self.show();self.tick.start()
+            for panel in getattr(self,'_restore_panels',[]):panel.show()
+            self._restore_panels=[];self.position_bubble()
             self.sync_dialogue_visibility()
         if hasattr(self,'tray'):
             state='已隐藏' if self.manual_hidden else ('全屏时自动隐藏' if self.fullscreen_hidden else '正在陪伴主人')
@@ -340,7 +539,7 @@ class Pet(QWidget):
         if state!=self.fullscreen_hidden and now-self.fullscreen_candidate_since>=(.25 if state else .75):
             self.fullscreen_hidden=state;self.apply_visibility()
         if self.desktop_hidden():
-            self.bubble.hide()
+            for panel in self.panels():panel.hide()
             if self.chat:self.chat.composer.hide()
         self.sync_dialogue_visibility()
     def constrained_position(self,position,pointer=None):
@@ -395,11 +594,12 @@ class Pet(QWidget):
             if self.mode=='movement':self.finish_movement();self.play(self.idles[0],'idle')
             self.move(position)
             if self.dragging:self.origin=self.pos();self.press_pos=QCursor.pos()
-        if self.bubble.isVisible():self.position_bubble()
+        if any(panel.isVisible() for panel in self.panels()):self.position_bubble()
         if self.chat:self.chat.position()
     def moveEvent(self,event):
         super().moveEvent(event)
         if getattr(self,'chat',None):self.chat.position()
+        if hasattr(self,'quota_bubble'):self.position_bubble()
     def asset_path(self,item):
         # Optional playbackFile allows future formats without changing the manifest's video source.
         return ASSETS/(item.get('playbackFile') or item['file'].replace('.webm','.webp'))
@@ -565,67 +765,77 @@ class Pet(QWidget):
     def snapshot_frame(self):
         pixmap=QPixmap(self.frame_size,self.frame_size);pixmap.fill(Qt.GlobalColor.transparent)
         painter=QPainter(pixmap);self.draw_frame(painter,QRectF(pixmap.rect()));painter.end();return pixmap
+    def panels(self):
+        return (self.bubble,self.task_bubble,self.quota_bubble)
     def position_bubble(self):
+        if getattr(self,'_positioning_panels',False):return
+        self._positioning_panels=True
+        try:
+            screen=QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+            area=screen.availableGeometry();pet=self.frameGeometry()
+            visible=[panel for panel in self.panels() if panel.isVisible()]
+            blockers=[]
+            if self.chat and self.chat.enabled and self.chat.composer.isVisible():blockers.append(self.chat.composer.frameGeometry())
+            if self.hover_bar.isVisible():blockers.append(self.hover_bar.frameGeometry())
+            points=panel_positions(pet,[panel.size() for panel in visible],area,blockers)
+            for panel,point in zip(visible,points):panel.move(point)
+        finally:self._positioning_panels=False
+    def position_hover_bar(self):
+        if not self.hover_bar.isVisible():return
         screen=QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
-        area=screen.availableGeometry();pet=self.frameGeometry()
-        width,height=self.bubble.width(),self.bubble.height();gap=12
-        if self.dock_edge in ('left','right'):
-            # The rotated sprite occupies only part of its transparent window.
-            # Attach to real painted pixels, not the empty window rectangle.
-            pixmap=self.grab();bounds=QRegion(pixmap.mask()).boundingRect();ratio=pixmap.devicePixelRatio()
-            visible=QRectF(bounds.x()/ratio,bounds.y()/ratio,bounds.width()/ratio,bounds.height()/ratio).toAlignedRect().translated(self.pos())
-            x=visible.right()+7 if self.dock_edge=='left' else visible.left()-width-6
-            y=visible.center().y()-height//2
-            self.bubble.move(clamp_position(QPoint(x,y),self.bubble.size(),area));return
-        if not getattr(self.bubble,'is_quota_result',False):
-            x=max(area.left(),min(pet.center().x()-width//2,area.right()-width+1))
-            y=pet.top()-height-gap
-            if y<area.top():y=pet.bottom()+gap+1
-            y=max(area.top(),min(y,area.bottom()-height+1))
-            self.bubble.move(x,y);return
-        # Prefer the sides; choose a screen-safe position with no character overlap.
-        candidates=[(pet.right()+gap+1,pet.center().y()-height//2),
-                    (pet.left()-width-gap,pet.center().y()-height//2),
-                    (pet.center().x()-width//2,pet.top()-height-gap),
-                    (pet.center().x()-width//2,pet.bottom()+gap+1)]
-        positions=[]
-        for x,y in candidates:
-            x=max(area.left(),min(x,area.right()-width+1))
-            y=max(area.top(),min(y,area.bottom()-height+1))
-            overlap=pet.intersected(QRect(x,y,width,height))
-            score=max(0,overlap.width())*max(0,overlap.height())
-            if self.chat and self.chat.enabled:
-                overlap=self.chat.composer.frameGeometry().intersected(QRect(x,y,width,height))
-                score+=max(0,overlap.width())*max(0,overlap.height())
-            positions.append((score,x,y))
-        _,x,y=min(positions,key=lambda item:item[0]);self.bubble.move(x,y)
+        area=screen.availableGeometry();size=self.hover_bar.size();pet=self.frameGeometry();gap=8
+        point=QPoint(pet.center().x()-size.width()//2,pet.bottom()+gap)
+        self.hover_bar.move(clamp_position(point,size,area));self.position_bubble()
+    def _keep_hover_bar(self):
+        self.hover_hide_timer.stop();self.position_hover_bar()
+    def _schedule_hover_bar_hide(self):
+        self.hover_hide_timer.start()
+    def _hide_hover_bar(self):
+        self.hover_hide_timer.stop();self.hover_bar.hide();self.position_bubble()
+    def _show_hover_bar(self):
+        if self.desktop_hidden() or self.dock_edge:return
+        self.hover_hide_timer.stop();self.hover_bar.show();self.position_hover_bar();self.hover_bar.raise_()
+    def _hover_action(self):
+        pool=self.interaction_animations()
+        if pool:self.choose(random.choice(pool))
+        self._hide_hover_bar()
+    def enterEvent(self,event):
+        self._show_hover_bar();super().enterEvent(event)
+    def leaveEvent(self,event):
+        self._schedule_hover_bar_hide();super().leaveEvent(event)
     def say(self,text,ms=4000):
         if self.speech_hidden():return
         self.bubble_timer.stop();self.bubble.message(text);self.position_bubble()
         if ms:self.bubble_timer.start(ms)
     def dismiss_bubble(self):
-        self.bubble_timer.stop()
-        self.bubble.hide()
+        self.bubble_timer.stop();self.bubble.hide()
+        self._restore_panels=[panel for panel in getattr(self,'_restore_panels',[]) if panel is not self.bubble]
+        self.position_bubble()
+    def dismiss_task_bubble(self):
+        self.task_timer.stop();self.task_bubble.hide()
+        self._restore_panels=[panel for panel in getattr(self,'_restore_panels',[]) if panel is not self.task_bubble]
+        self.position_bubble()
+    def dismiss_quota_bubble(self):
+        self.quota_timer.stop();self.quota_bubble.hide()
+        self._restore_panels=[panel for panel in getattr(self,'_restore_panels',[]) if panel is not self.quota_bubble]
+        self.position_bubble()
         if self.mode=='quota':self.idle()
     def task_result(self,title,text,details):
-        if self.task_bubbles_disabled:return
-        if self.speech_hidden():return
-        self.generation+=1;self.bubble_timer.stop()
-        self.bubble.task_result(title,text,details);self.position_bubble();self.bubble_timer.start(20000)
+        if self.task_bubbles_disabled or self.desktop_hidden():return
+        self.task_timer.stop()
+        self.task_bubble.task_result(title,text,details);self.position_bubble()
     def task_progress(self,title,text,details):
-        if self.task_bubbles_disabled:return
-        if self.desktop_hidden():return
-        self.bubble_timer.stop()
-        if getattr(self.bubble,'is_task_progress',False) and self.bubble.isVisible():
-            view=self.bubble.result_view;bar=view.verticalScrollBar()
+        if self.task_bubbles_disabled or self.desktop_hidden():return
+        panel=self.task_bubble;self.task_timer.stop()
+        if getattr(panel,'is_task_progress',False) and panel.isVisible():
+            view=panel.result_view;bar=view.verticalScrollBar()
             bottom=bar.value()>=bar.maximum()-8;old=bar.value()
-            self.bubble.result_title.setText(title);view.setPlainText(text)
+            panel.result_title.setText(title);view.setPlainText(text)
             bar.setValue(bar.maximum() if bottom else min(old,bar.maximum()))
         else:
-            self.bubble.task_result(title,text,details);self.bubble.is_task_progress=True
-        self.position_bubble();self.bubble_timer.start(12000)
+            panel.task_result(title,text,details);panel.is_task_progress=True
+        self.position_bubble()
     def task_completed(self,text,details):
-        self.play_click_sound()
         celebration=next((v for v in self.variants if v['id']=='18'),None)
         if celebration and not self.dock_edge:self.play(celebration,'task-celebration')
         # Play directly so the celebration's interaction line is never shown.
@@ -660,6 +870,10 @@ class Pet(QWidget):
         menu.addSeparator()
         menu.addAction('关闭对话模式' if self.chat and self.chat.enabled else '打开对话模式',self.toggle_chat)
         menu.addAction('查看历史对话',self.open_history)
+        menu.addAction('刷新额度与中转站',self.quota)
+        menu.addAction('中转站设置…',self.show_station_settings)
+        codex_panel=menu.addAction('显示 Codex 额度卡片');codex_panel.setCheckable(True);codex_panel.setChecked(self.show_codex_panel);codex_panel.toggled.connect(self.set_codex_panel)
+        station_panel=menu.addAction('显示 DogAPI 卡片');station_panel.setCheckable(True);station_panel.setChecked(self.show_station_panel);station_panel.toggled.connect(self.set_station_panel)
         menu.addAction('对话框大小…',self.show_bubble_settings)
         menu.addSeparator()
         interaction=QMenu('互动差分动画',menu);menu.addMenu(interaction)
@@ -692,17 +906,195 @@ class Pet(QWidget):
         menu.addSeparator()
         menu.addAction('退出桌宠',self.close)
         return menu
+
+    def show_station_settings(self):
+        """Configure the read-only DogAPI API key without exposing it in the UI."""
+        dialog=QDialog(self,Qt.WindowType.Tool|Qt.WindowType.WindowStaysOnTopHint)
+        dialog.setWindowTitle('DogAPI 中转站设置')
+        layout=QVBoxLayout(dialog);layout.setContentsMargins(18,16,18,16);layout.setSpacing(11)
+        form=QFormLayout();form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        base=QLineEdit(str(self.settings.value('stationBaseUrl',DEFAULT_BASE_URL)),dialog);base.setMinimumWidth(300)
+        key=QLineEdit(dialog);key.setEchoMode(QLineEdit.EchoMode.Password);key.setPlaceholderText('输入 API Key（sk-…），留空保持已保存密钥')
+        clear=QCheckBox('清除已保存的 API Key',dialog)
+        billing=QLineEdit(dialog);billing.setEchoMode(QLineEdit.EchoMode.Password);billing.setPlaceholderText('网站用户 Access Token；留空保留已保存的令牌')
+        account=QLineEdit(str(self.settings.value('stationAccountId','')),dialog);account.setPlaceholderText('个人资料中的数字账号 ID')
+        clear_billing=QCheckBox('清除已保存的账单访问令牌',dialog)
+        form.addRow('接口地址：',base);form.addRow('API Key：',key);form.addRow('',clear)
+        form.addRow('账单访问令牌：',billing);form.addRow('账号 ID：',account);form.addRow('',clear_billing);layout.addLayout(form)
+        hint=QLabel('钱包余额使用 API Key；完整的今日消耗需要网站用户 Access Token。\n'
+                    '获取位置：DogAPI 网站 → Profile（个人资料）→ Security（安全）→ Access Token。'
+                    '网站打开此项会重新生成令牌，可能使旧令牌失效。账号 ID 可在个人资料姓名旁复制。\n'
+                    '桌宠只使用这些设置查询余额和今日账单，不会生成或修改网站令牌。',dialog)
+        hint.setMaximumWidth(450);hint.setWordWrap(True);hint.setStyleSheet('color:#7d6d8c;font-size:11px;');layout.addWidget(hint)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel,dialog);layout.addWidget(buttons)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText('保存');buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        def save():
+            try:url=normalize_base_url(base.text())
+            except StationFailure as error:QMessageBox.warning(dialog,'地址无效',str(error));return
+            account_id=account.text().strip()
+            if account_id and (not account_id.isascii() or not account_id.isdecimal() or int(account_id)<=0):
+                QMessageBox.warning(dialog,'账号 ID 无效','请填写个人资料中的数字账号 ID。');return
+            self.settings.setValue('stationBaseUrl',url)
+            if clear.isChecked():self.settings.remove('stationApiKey')
+            elif key.text().strip():self.settings.setValue('stationApiKey',key.text().strip())
+            self.settings.setValue('stationAccountId',account_id)
+            if clear_billing.isChecked():self.settings.remove('stationBillingToken')
+            elif billing.text().strip():self.settings.setValue('stationBillingToken',billing.text().strip())
+            dialog.accept();self.say('DogAPI 设置已保存。正在刷新面板…',2500);self.quota()
+        buttons.accepted.connect(save);buttons.rejected.connect(dialog.reject)
+        dialog.adjustSize();self.position_size_dialog(dialog=dialog);dialog.show();dialog.raise_();dialog.activateWindow();dialog.exec()
     def set_sound_disabled(self,disabled):
-        self.sound_disabled=bool(disabled);self.settings.setValue('soundDisabled',self.sound_disabled)
+        self.sound_disabled=bool(disabled);self.settings.setValue('soundDisabled',self.sound_disabled);self._update_sound_button()
+        if self.sound_disabled:
+            if sys.platform=='win32':
+                import winsound
+                winsound.PlaySound(None,0)
+            elif hasattr(self,'click_sound'):self.click_sound.stop()
+    def _sound_presets(self):
+        """List only installed WAV presets; metadata alone is not an audio asset."""
+        folder=(ROOT/'app/sounds').resolve()
+        try:
+            entries=json.loads((folder/'presets.json').read_text(encoding='utf-8-sig'))
+        except (OSError,ValueError):return {}
+        if not isinstance(entries,list):return {}
+        presets={}
+        for entry in entries:
+            if not isinstance(entry,dict):continue
+            sound_id=entry.get('id');name=entry.get('name');file=entry.get('file')
+            if not isinstance(sound_id,str) or not sound_id.strip() or sound_id in ('click','duck','custom'):continue
+            if not isinstance(name,str) or not name.strip() or not isinstance(file,str):continue
+            try:
+                path=(folder/file).resolve()
+                if path.suffix.lower()!='.wav' or not path.is_relative_to(folder) or not path.is_file():continue
+            except (OSError,ValueError):continue
+            presets[sound_id]={'name':name,'file':path}
+        return presets
+    def _sound_file(self):
+        if self.sound_mode not in ('click','duck','custom'):
+            preset=self._sound_presets().get(self.sound_mode)
+            if preset:return preset['file']
+            self.sound_mode='duck';self.settings.setValue('soundMode','duck');self._update_sound_button()
+        if self.sound_mode=='custom':
+            candidate=Path(self.sound_path).expanduser() if self.sound_path else None
+            if candidate and candidate.is_file():return candidate
+            self.sound_mode='duck';self.settings.setValue('soundMode','duck');self._update_sound_button()
+        if self.sound_mode=='duck':
+            candidate=ROOT/'app/sounds/duck_squeak.wav'
+            if candidate.is_file():return candidate
+            self.sound_mode='click';self.settings.setValue('soundMode','click');self._update_sound_button()
+        return ROOT/'app/sounds/click.wav'
+    def _update_sound_button(self):
+        if not hasattr(self,'hover_bar') or not hasattr(self.hover_bar,'声音'):return
+        self.hover_bar.声音.setText('声音')
+        preset=self._sound_presets().get(self.sound_mode)
+        name='已静音' if self.sound_disabled else (preset['name'] if preset else '小黄鸭 · 爱给网' if self.sound_mode=='duck' else (self.sound_name or '自定义音效') if self.sound_mode=='custom' else '原点击声')
+        self.hover_bar.声音.setToolTip('当前：'+name+'\n点击更换、添加或试听声音')
+    def set_sound_mode(self,mode,path=''):
+        self.sound_mode=mode if mode in ('click','duck','custom') or mode in self._sound_presets() else 'duck'
+        if self.sound_mode=='custom':
+            candidate=Path(path or self.sound_path)
+            if not candidate.is_file():
+                self.sound_mode='duck';self.settings.setValue('soundMode','duck');self._update_sound_button()
+                QMessageBox.warning(self,'音效文件不存在','之前的音效文件已经移走，已恢复小黄鸭声音。请重新添加音效。');return
+            self.sound_path=str(candidate)
+        self.sound_disabled=False
+        self.settings.setValue('soundMode',self.sound_mode);self.settings.setValue('soundPath',self.sound_path);self.settings.setValue('soundDisabled',False)
+        self._update_sound_button();self.play_click_sound()
+    def show_sound_menu(self):
+        menu=QMenu(self)
+        if (ROOT/'app/sounds/duck_squeak.wav').is_file():
+            duck=menu.addAction('小黄鸭 · 爱给网');duck.setCheckable(True);duck.setChecked(not self.sound_disabled and self.sound_mode=='duck');duck.triggered.connect(lambda:self.set_sound_mode('duck'))
+        click=menu.addAction('原点击声');click.setCheckable(True);click.setChecked(not self.sound_disabled and self.sound_mode=='click');click.triggered.connect(lambda:self.set_sound_mode('click'))
+        for sound_id,preset in self._sound_presets().items():
+            action=menu.addAction(preset['name']);action.setCheckable(True);action.setChecked(not self.sound_disabled and self.sound_mode==sound_id)
+            action.triggered.connect(lambda checked=False,key=sound_id:self.set_sound_mode(key))
+        if self.sound_path:
+            custom=menu.addAction(self.sound_name or Path(self.sound_path).stem);custom.setCheckable(True);custom.setChecked(not self.sound_disabled and self.sound_mode=='custom');custom.triggered.connect(lambda:self.set_sound_mode('custom'))
+        menu.addSeparator()
+        preview=menu.addAction('试听当前音效');preview.triggered.connect(lambda:self.play_click_sound(preview=True))
+        add=menu.addAction('添加或更换本地音效…');add.setEnabled(self.sound_import is None);add.triggered.connect(self.choose_sound_file)
+        menu.addSeparator();mute=menu.addAction('关闭声音');mute.setCheckable(True);mute.setChecked(self.sound_disabled);mute.triggered.connect(self.set_sound_disabled)
+        menu.exec(self.hover_bar.mapToGlobal(QPoint(0,self.hover_bar.height()+4)))
+        menu.deleteLater()
+    def choose_sound_file(self):
+        if self.sound_import is not None:return
+        path,_=QFileDialog.getOpenFileName(self,'选择音效文件','', '音频文件 (*.wav *.mp3 *.ogg *.flac);;所有文件 (*.*)')
+        if path:self.import_sound_file(path)
+    def import_sound_file(self,path):
+        """Decode and keep an imported sound without blocking the UI."""
+        if self.sound_import is not None:return
+        import re
+        from video_frames import ffmpeg_path
+        try:
+            source=Path(path)
+            if not source.is_file():raise ValueError('所选音效文件不存在，请重新选择。')
+            ffmpeg=ffmpeg_path()
+            # Keep imported media outside both the C drive and release trees.
+            if sys.platform=='win32':
+                if not Path('D:/').is_dir():raise ValueError('D 盘不可用，暂时无法保存导入音效。')
+                folder=Path('D:/CodexDragonBuild/UserData/sounds')
+            else:folder=STATE_ROOT/'sounds'
+            folder.mkdir(parents=True,exist_ok=True)
+            stem=re.sub(r'[^\w\- ]','_',source.stem)[:60].strip() or '音效'
+            target=folder/f'{stem}-{time.time_ns()}.wav'
+            pending=target.with_suffix('.importing.wav')
+        except (OSError,ValueError,RuntimeError) as error:
+            QMessageBox.warning(self,'音效导入失败',str(error));return
+        process=QProcess(self)
+        progress=QProgressDialog('正在添加音效…','取消',0,0,self);progress.setWindowTitle('添加声音');progress.setWindowModality(Qt.WindowModality.NonModal);progress.setMinimumDuration(0)
+        timer=QTimer(self);timer.setSingleShot(True);timer.setInterval(60000)
+        self.sound_import={'process':process,'progress':progress,'timer':timer,'pending':pending,'target':target,'name':source.stem,'cancelled':False,'timeout':False}
+        progress.canceled.connect(self.cancel_sound_import)
+        timer.timeout.connect(self._sound_import_timeout)
+        process.finished.connect(self._finish_sound_import)
+        process.errorOccurred.connect(lambda error:self._finish_sound_import(-1) if error==QProcess.ProcessError.FailedToStart else None)
+        process.start(ffmpeg,['-hide_banner','-loglevel','error','-nostdin','-i',str(source),'-map','0:a:0','-vn','-ac','1','-ar','44100','-c:a','pcm_s16le','-threads','1','-y',str(pending)])
+        timer.start();progress.show()
+    def _sound_import_timeout(self):
+        if self.sound_import:
+            self.sound_import['timeout']=True;self.sound_import['process'].kill()
+    def cancel_sound_import(self,closing=False):
+        if self.sound_import:
+            job=self.sound_import;job['cancelled']=True
+            job['process'].kill()
+            if closing:job['process'].waitForFinished(1500)
+    def _finish_sound_import(self,code,*args):
+        job=self.sound_import
+        if not job:return
+        self.sound_import=None;job['timer'].stop();job['timer'].deleteLater();job['progress'].close();job['progress'].deleteLater();job['process'].deleteLater()
+        import wave
+        error=None
+        try:
+            if job['cancelled']:return
+            if job['timeout']:raise ValueError('音效处理超时，请选择较短的音频。')
+            if code!=0:raise ValueError('无法读取这个音频，请换用有效的 WAV、MP3、OGG 或 FLAC 文件。')
+            with wave.open(str(job['pending']),'rb') as audio:
+                if audio.getnframes()==0:raise ValueError('所选音频没有可播放的声音。')
+            job['pending'].replace(job['target'])
+            self.sound_name=job['name'];self.settings.setValue('soundName',self.sound_name)
+            self.set_sound_mode('custom',str(job['target']))
+        except (OSError,ValueError,EOFError,wave.Error) as problem:error=str(problem)
+        finally:
+            try:job['pending'].unlink(missing_ok=True)
+            except OSError:pass
+        if error:QMessageBox.warning(self,'音效导入失败',error)
+    def show_hover_menu(self):
+        menu=self.context_menu();menu.exec(self.hover_bar.mapToGlobal(QPoint(self.hover_bar.width(),self.hover_bar.height()+4)));menu.deleteLater()
+    def set_codex_panel(self,enabled):
+        self.show_codex_panel=bool(enabled);self.settings.setValue('showCodexPanel',self.show_codex_panel)
+        if self.quota_bubble.isVisible():self.quota()
+    def set_station_panel(self,enabled):
+        self.show_station_panel=bool(enabled);self.settings.setValue('showStationPanel',self.show_station_panel)
+        if self.quota_bubble.isVisible():self.quota()
     def set_task_bubbles_disabled(self,disabled):
         self.task_bubbles_disabled=bool(disabled)
         self.settings.setValue('taskBubblesDisabled',self.task_bubbles_disabled)
-        if disabled and self.bubble.is_task_bubble:self.dismiss_bubble()
+        if disabled:self.dismiss_task_bubble()
     def set_bubble_percent(self,value):
         self.bubble_percent=max(50,min(150,int(value)))
-        self.bubble.set_scale_percent(self.bubble_percent)
+        for panel in self.panels():panel.set_scale_percent(self.bubble_percent)
         self.settings.setValue('bubblePercent',self.bubble_percent)
-        if self.bubble.isVisible():self.position_bubble()
+        if any(panel.isVisible() for panel in self.panels()):self.position_bubble()
     def show_bubble_settings(self):
         if not hasattr(self,'bubble_settings_dialog'):
             dialog=QDialog(self,Qt.WindowType.Tool|Qt.WindowType.WindowStaysOnTopHint)
@@ -798,26 +1190,37 @@ class Pet(QWidget):
             else:position.setY(area.bottom()+1-pixels)
             self.move(position)
         self.settings.setValue('sizePercent',value)
-        if self.bubble.isVisible():self.position_bubble()
+        if any(panel.isVisible() for panel in self.panels()):self.position_bubble()
         if self.chat:self.chat.position()
         self.update()
     def preview_idle(self,item):
         self.note_interaction()
         self.click_timer.stop();self.last_click=None;self.generation+=1;self.play(item,'idle')
-    def play_click_sound(self):
-        if self.sound_disabled:return
+    def play_click_sound(self,preview=False):
+        if self.sound_disabled and not preview:return
+        sound=self._sound_file()
+        # Ignore duplicate dispatch within one UI event; repeated clicks after
+        # this short guard still play their own single, non-looping sound.
+        now=time.monotonic();last=getattr(self,'_last_sound_play',None)
+        if not preview and last and last[0]==sound and now-last[1]<.06:return
         if sys.platform=='darwin':
             from PySide6.QtMultimedia import QSoundEffect
             from PySide6.QtCore import QUrl
             if not hasattr(self,'click_sound'):
-                self.click_sound=QSoundEffect(self);self.click_sound.setSource(QUrl.fromLocalFile(str(ROOT/'app/sounds/click.wav')))
-            self.click_sound.play();return
+                self.click_sound=QSoundEffect(self)
+            self.click_sound.setLoopCount(1)
+            source=QUrl.fromLocalFile(str(sound))
+            if self.click_sound.source()!=source:self.click_sound.setSource(source)
+            self.click_sound.play();self._last_sound_play=(sound,now);return
         if sys.platform=='win32':
             import winsound
-            sound=ROOT/'app/sounds/click.wav'
             if sound.is_file():
-                try:winsound.PlaySound(str(sound),winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
-                except RuntimeError:pass
+                try:
+                    # Deliberately omit SND_LOOP: one input means one play.
+                    winsound.PlaySound(str(sound),winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
+                    self._last_sound_play=(sound,now)
+                except RuntimeError:
+                    if preview:QMessageBox.warning(self,'音效无法播放','这个音效无法播放，请重新导入或切换到小黄鸭声音。')
     def choose(self,item):
         self.note_interaction()
         self.click_timer.stop();self.last_click=None;self.generation+=1
@@ -833,24 +1236,75 @@ class Pet(QWidget):
         return self.variants+[v for v in self.work_slots if v and self.asset_path(v).is_file()]
     def quota(self):
         self.note_interaction()
-        self.click_timer.stop();self.last_click=None;self.generation+=1;token=self.generation
+        self.click_timer.stop();self.last_click=None;self.generation+=1
         self.play_click_sound()
         if not self.dock_edge:self.play(self.manifest.get('quotaAnimation') or self.idles[0],'quota')
-        self.say('让我看看额度还有多少。。。。。。',0)
-        if self.quota_inflight:
-            # Repeated requests share the in-flight read; delivery uses the newest generation.
-            self.quota_generation=token;return
-        self.quota_generation=token;self.quota_inflight=True;self.worker=QuotaWorker(self)
-        self.worker.ready.connect(self.quota_ready);self.worker.failed.connect(self.quota_failed);self.worker.start()
+        self.dashboard_requested=True
+        # Reuse requests already in progress and keep their last successful
+        # results visible. Animation clicks must not invalidate quota replies.
+        if self.show_codex_panel and not self.quota_inflight:
+            self.quota_inflight=True;self.quota_error=None
+            self.worker=QuotaWorker(self);self.worker.ready.connect(self.quota_ready);self.worker.failed.connect(self.quota_failed);self.worker.start()
+        if self.show_station_panel:self.refresh_station_silently()
+        self._render_dashboard()
+    def refresh_station_silently(self):
+        """Refresh DogAPI every minute without opening a hidden dashboard."""
+        if not self.show_station_panel:return
+        context=self._station_context()
+        base_url,api_key,billing_token,account_id=context
+        # A response for an old key must never replace the newly configured
+        # account's card. Credentials stay in memory, outside UI snapshots.
+        if self.station_snapshot_context!=context:
+            self.station_snapshot=None
+        if not api_key:
+            self.station_error='未配置 DogAPI API Key。右键桌宠 → 中转站设置…'
+            self._render_dashboard();return
+        if self.station_inflight:return
+        self.station_inflight=True;self.station_error=None;self.station_request_context=context
+        self.station_worker=StationWorker(api_key,base_url,self,billing_access_token=billing_token,account_id=account_id)
+        self.station_worker.ready.connect(lambda snapshot,source=context:self.station_ready(snapshot,source))
+        self.station_worker.failed.connect(lambda error,source=context:self.station_failed(error,source))
+        self.station_worker.start();self._render_dashboard()
+    def _station_context(self):
+        return tuple(str(self.settings.value(name,default)).strip() for name,default in (
+            ('stationBaseUrl',DEFAULT_BASE_URL),('stationApiKey',''),('stationBillingToken',''),('stationAccountId','')))
+    def refresh_card(self,provider):
+        self.note_interaction();self.dashboard_requested=True
+        if provider=='station':self.refresh_station_silently()
+        elif provider=='codex' and self.show_codex_panel and not self.quota_inflight:
+            self.quota_inflight=True;self.quota_error=None
+            self.worker=QuotaWorker(self);self.worker.ready.connect(self.quota_ready);self.worker.failed.connect(self.quota_failed);self.worker.start()
+        self._render_dashboard()
     def quota_ready(self,windows):
-        self.quota_inflight=False
-        if self.speech_hidden():return
-        if self.quota_generation!=self.generation:return
-        self.bubble.quota(windows);self.position_bubble();self.bubble_timer.start(12000)
+        self.quota_inflight=False;self.quota_error=None
+        self.current_quota_windows=windows;self._render_dashboard()
     def quota_failed(self,error):
-        self.quota_inflight=False
-        if self.quota_generation==self.generation:self.say('主人，我暂时没查到额度，过一会儿再看看好不好？\n'+error,8000)
+        self.quota_inflight=False;self.quota_error=str(error);self._render_dashboard()
+    def station_ready(self,snapshot,context=None):
+        self.station_inflight=False
+        current=self._station_context()
+        if context is not None and context!=current:
+            self.refresh_station_silently();self._render_dashboard();return
+        self.station_snapshot=snapshot;self.station_snapshot_context=current;self.station_error=None;self._render_dashboard()
+    def station_failed(self,error,context=None):
+        self.station_inflight=False
+        current=self._station_context()
+        if context is not None and context!=current:
+            self.refresh_station_silently();self._render_dashboard();return
+        self.station_error=str(error);self._render_dashboard()
+    def _render_dashboard(self):
+        # Background refreshes update a card that is already open. They must
+        # not reopen a dismissed panel or replace a conversation bubble.
+        if self.desktop_hidden():
+            self.dashboard_requested=False;return
+        if not self.dashboard_requested and not self.quota_bubble.isVisible():return
+        self.quota_bubble.dashboard(self.current_quota_windows,self.station_snapshot,self.station_error,self.show_codex_panel,self.show_station_panel,codex_error=self.quota_error,codex_loading=self.quota_inflight,station_loading=self.station_inflight)
+        self.dashboard_requested=False
+        self.position_bubble()
+        if self.quota_inflight or self.station_inflight:self.quota_timer.stop()
+        else:self.quota_timer.start(20000)
     def mousePressEvent(self,event):
+        self._hide_hover_bar()
         if event.button()==Qt.MouseButton.LeftButton and self.dock_edge:
             self.consume_dock_release=True;self.pointer_down=False
             self.note_interaction(cancel_movement=False)
@@ -904,9 +1358,14 @@ class Pet(QWidget):
     def closeEvent(self,event):
         if self.chat and not self.chat.shutdown():
             event.ignore();QTimer.singleShot(500,self.close);return
+        self.cancel_sound_import(closing=True)
         self.desktop_sync.stop()
-        self.tick.stop();self.visibility_timer.stop();self.tray.hide();self.bubble.close()
+        self.tick.stop();self.visibility_timer.stop();self.station_timer.stop();self.tray.hide()
+        self.bubble_timer.stop();self.task_timer.stop();self.quota_timer.stop()
+        for panel in self.panels():panel.close()
+        self.hover_bar.close()
         if self.worker and self.worker.isRunning():self.worker.cancel.set();self.worker.wait(3000)
+        if self.station_worker and self.station_worker.isRunning():self.station_worker.cancel.set();self.station_worker.wait(3000)
         QApplication.quit();event.accept()
 
 def main():
@@ -930,7 +1389,8 @@ def main():
     if socket.waitForConnected(150):return 0
     QLocalServer.removeServer('bailong-desktop-pet-v1');server=QLocalServer();server.listen('bailong-desktop-pet-v1')
     try:
-        pet=Pet();pet.show();configure_mac_window(pet);configure_mac_window(pet.bubble)
+        pet=Pet();pet.show();configure_mac_window(pet)
+        for panel in pet.panels():configure_mac_window(panel)
         def reveal_existing_pet():
             while server.hasPendingConnections():
                 connection=server.nextPendingConnection()
@@ -958,6 +1418,7 @@ def main():
             (STATE_ROOT/'app').mkdir(parents=True,exist_ok=True)
             (STATE_ROOT/'app/运行状态.json').write_text(json.dumps({'version':VERSION,'pid':os.getpid(),'visible':pet.isVisible(),'nativeVisible':native_visible,'windowId':int(pet.winId()),'variants':len(pet.variants),'position':[pet.x(),pet.y()],'displaySize':[pet.width(),pet.height()],'frameSize':[self_size for self_size in (pet.frames[0].width(),pet.frames[0].height())]},ensure_ascii=False),encoding='utf-8')
         QTimer.singleShot(1000,record_startup)
+        if '--show-quota' in sys.argv:QTimer.singleShot(1200,pet.quota)
         def record_visibility():
             (STATE_ROOT/'app/显示诊断.json').write_text(json.dumps({'pid':os.getpid(),'visible':pet.isVisible(),'manualHidden':pet.manual_hidden,'fullscreenHidden':pet.fullscreen_hidden,'trayVisible':pet.tray.isVisible(),'trayAvailable':QSystemTrayIcon.isSystemTrayAvailable(),'syncWatching':pet.desktop_sync.timer.isActive(),'syncActive':len(pet.desktop_sync.running),'syncObserved':len(pet.desktop_sync.known),'platform':QApplication.platformName(),'position':[pet.x(),pet.y()],'windowId':int(pet.winId())},ensure_ascii=False),encoding='utf-8')
         diagnostic_timer=QTimer(pet);diagnostic_timer.setInterval(2000);diagnostic_timer.timeout.connect(record_visibility);diagnostic_timer.start()

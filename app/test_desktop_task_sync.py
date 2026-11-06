@@ -86,19 +86,19 @@ class DockIntegrationTests(unittest.TestCase):
   p=self.pet;p.dock_edge='left';p.play(p.idles[0],'idle')
   with patch.object(p,'play_click_sound'):
    p.task_started();p.task_progress('主人，我收到啦！','任务已收到',lambda:None)
-   self.assertEqual(p.mode,'idle');self.assertEqual(p.dock_edge,'left');self.assertTrue(p.bubble.isVisible())
+   self.assertEqual(p.mode,'idle');self.assertEqual(p.dock_edge,'left');self.assertTrue(p.task_bubble.isVisible())
    p.task_progress('主人，遇到一个问题。','请确认权限',lambda:None);self.assertEqual(p.mode,'idle')
    p.task_finished();p.task_completed('完整任务结果',lambda:None)
-   self.assertEqual(p.mode,'idle');self.assertEqual(p.dock_edge,'left');self.assertEqual(p.bubble.result_view.toPlainText(),'完整任务结果')
+   self.assertEqual(p.mode,'idle');self.assertEqual(p.dock_edge,'left');self.assertEqual(p.task_bubble.result_view.toPlainText(),'完整任务结果')
   p.undock()
  def test_can_dock_during_active_task(self):
   p=self.pet;area=QApplication.primaryScreen().availableGeometry()
   p.task_started();p.move(area.left(),area.top()+100)
   self.assertTrue(p.try_dock());self.assertEqual(p.dock_edge,'left')
   self.assertTrue(p.task_active);self.assertEqual(p.mode,'idle')
-  p.task_progress('进展','正在处理',lambda:None);self.assertTrue(p.bubble.isVisible())
+  p.task_progress('进展','正在处理',lambda:None);self.assertTrue(p.task_bubble.isVisible())
   p.undock();p.task_finished()
- def test_docked_bubble_is_close_and_can_be_dismissed(self):
+ def test_docked_report_avoids_pet_and_can_be_dismissed(self):
   from PySide6.QtCore import QRectF
   from PySide6.QtGui import QRegion
   p=self.pet;area=QApplication.primaryScreen().availableGeometry()
@@ -108,11 +108,11 @@ class DockIntegrationTests(unittest.TestCase):
    p.task_progress('主人，进度来了。','测试进展',lambda:None)
    pixmap=p.grab();b=QRegion(pixmap.mask()).boundingRect();r=pixmap.devicePixelRatio()
    visible=QRectF(b.x()/r,b.y()/r,b.width()/r,b.height()/r).toAlignedRect().translated(p.pos())
-   gap=p.bubble.x()-visible.right()-1 if side=='left' else visible.left()-p.bubble.frameGeometry().right()-1
-   self.assertGreaterEqual(gap,0);self.assertLessEqual(gap,8)
-   self.assertTrue(p.bubble.close_button.isVisible())
-   p.task_active=True;p.bubble.close_button.click()
-   self.assertFalse(p.bubble.isVisible());self.assertFalse(p.bubble_timer.isActive());self.assertTrue(p.task_active)
+   self.assertFalse(p.task_bubble.frameGeometry().intersects(visible))
+   self.assertTrue(area.contains(p.task_bubble.frameGeometry()))
+   self.assertTrue(p.task_bubble.close_button.isVisible())
+   p.task_active=True;p.task_bubble.close_button.click()
+   self.assertFalse(p.task_bubble.isVisible());self.assertFalse(p.task_timer.isActive());self.assertTrue(p.task_active)
    p.task_active=False;p.undock()
  def test_pose_changes_select_the_right_animation_policy(self):
   p=self.pet;area=QApplication.primaryScreen().availableGeometry();p.task_started()

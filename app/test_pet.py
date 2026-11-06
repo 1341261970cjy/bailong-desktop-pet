@@ -12,7 +12,7 @@ app=QApplication.instance() or QApplication([])
 class Tests(unittest.TestCase):
     def setUp(self):self.pet=Pet();self.pet.show()
     def tearDown(self):
-        self.pet.tick.stop();self.pet.bubble.close();self.pet.hide()
+        self.pet.close()
         self.pet.frames=[];self.pet.cache.clear();self.pet.pinned_frames.clear();self.pet.transition=None
         self.pet.deleteLater();app.processEvents()
     def test_all_assets_and_idle_weights(self):
@@ -30,27 +30,31 @@ class Tests(unittest.TestCase):
         QTest.mouseClick(self.pet,Qt.MouseButton.LeftButton,pos=QPoint(160,160));QTest.qWait(300)
         self.assertEqual(self.pet.mode,'variant');self.assertTrue(self.pet.bubble.isVisible())
         self.assertLessEqual(self.pet.bubble_timer.remainingTime(),4000)
-    def test_variant_return_and_quota_stale(self):
+    def test_hidden_quota_failure_preserves_interaction(self):
         self.pet.choose(self.pet.variants[0]);self.pet.started=time.monotonic()-4.01;self.pet.animate()
         self.assertEqual(self.pet.mode,'idle')
-        self.pet.quota_generation=1;self.pet.generation=2
-        self.pet.quota_failed('obsolete');self.assertNotIn('obsolete',self.pet.bubble.findChildren(__import__('PySide6.QtWidgets',fromlist=['QLabel']).QLabel)[0].text())
+        from PySide6.QtWidgets import QLabel
+        message=self.pet.bubble.findChildren(QLabel)[0].text()
+        self.pet.quota_failed('obsolete')
+        self.assertEqual(self.pet.bubble.findChildren(QLabel)[0].text(),message)
+        self.assertFalse(self.pet.quota_bubble.isVisible())
     def test_quota_parsing(self):
         data={'rateLimitsByLimitId':{'codex':{'primary':{'usedPercent':23,'windowDurationMins':300},'secondary':{'usedPercent':10,'windowDurationMins':10080}}}}
         windows=quota_windows(data);self.assertEqual([w['remaining'] for w in windows],[77,90]);self.assertEqual(windows[1]['name'],'一周')
         with self.assertRaises(RuntimeError):quota_windows({})
     def test_loading_then_progress_and_resume(self):
+        self.pet.show_codex_panel=True;self.pet.show_station_panel=False
         with patch('pet.QuotaWorker') as worker:
             self.pet.quota()
             self.assertEqual(self.pet.mode,'quota')
             self.assertEqual(self.pet.current['id'],self.pet.manifest.get('quotaAnimation',self.pet.idles[0])['id'])
-            from PySide6.QtWidgets import QLabel,QProgressBar
-            self.assertEqual(self.pet.bubble.findChildren(QLabel)[0].text(),'让我看看额度还有多少。。。。。。')
+            from PySide6.QtWidgets import QLabel,QProgressBar,QPushButton
+            self.assertTrue(self.pet.quota_bubble.findChild(QPushButton,'refreshCodex').property('loading'))
             self.pet.quota_ready([{'name':'5小时','remaining':76,'resetsAt':None},{'name':'一周','remaining':91,'resetsAt':None}])
-            self.assertEqual([b.value() for b in self.pet.bubble.findChildren(QProgressBar)],[76,91])
+            self.assertEqual([b.value() for b in self.pet.quota_bubble.findChildren(QProgressBar)],[76,91])
             self.pet.started=time.monotonic()-4.1;self.pet.animate()
-            self.assertEqual(self.pet.mode,'idle');self.assertTrue(self.pet.bubble.isVisible())
-            self.pet.dismiss_bubble();self.assertEqual(self.pet.mode,'idle')
+            self.assertEqual(self.pet.mode,'idle');self.assertTrue(self.pet.quota_bubble.isVisible())
+            self.pet.dismiss_quota_bubble();self.assertEqual(self.pet.mode,'idle')
             self.pet.worker=None
     def test_menu_contains_all_variants_and_exit(self):
         actions=[]
@@ -59,7 +63,7 @@ class Tests(unittest.TestCase):
             actions.extend(a.text() for a in menu.actions() if not a.isSeparator());menu.close()
         QTimer.singleShot(100,inspect)
         QTest.mouseClick(self.pet,Qt.MouseButton.RightButton,pos=QPoint(160,160))
-        self.assertEqual(actions,['隐藏桌宠','全屏时自动隐藏','打开对话模式','查看历史对话','对话框大小…','互动差分动画','工作差分动画','待机差分动画','移动差分','禁用自移动','桌宠大小…','禁用音效','退出桌宠'])
+        self.assertTrue({'隐藏桌宠','全屏时自动隐藏','打开对话模式','查看历史对话','对话框大小…','互动差分动画','工作差分动画','待机差分动画','移动差分','禁用自移动','桌宠大小…','禁用音效','中转站设置…','显示 Codex 额度卡片','显示 DogAPI 卡片'}.issubset(actions))
         self.assertEqual(actions[-1],'退出桌宠')
     def test_drag_landing_and_click_suppression(self):
         from types import SimpleNamespace

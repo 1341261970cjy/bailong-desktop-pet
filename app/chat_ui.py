@@ -5,19 +5,71 @@ from pathlib import Path
 import queue
 import threading
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QEvent, QPoint
+from PySide6.QtGui import QPainter, QFontMetrics, QFont
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QPlainTextEdit, QTextBrowser, QListWidget, QSplitter, QFileDialog, QMessageBox,
-    QInputDialog, QDialog, QDialogButtonBox)
+    QInputDialog, QDialog, QDialogButtonBox, QFrame, QSizePolicy, QSizeGrip)
 
 from chat_backend import HistoryStore, CodexSession, TaskCancelled
 
 FLAGS = Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
-STYLE = '''QWidget {font-family:"Microsoft YaHei","Segoe UI";font-size:12px;color:#38294d;background:#fcfaff;}
-QPushButton {background:#eee6f7;border:1px solid #d6c5e7;border-radius:8px;padding:6px 10px;}
-QPushButton:hover {background:#e3d3f1;} QPushButton:disabled {color:#92869d;}
-QPlainTextEdit,QTextBrowser,QListWidget {background:white;border:1px solid #d9cbe5;border-radius:8px;padding:6px;}
-QListWidget::item:selected {background:#eadff4;color:#38294d;}'''
+STYLE = '''QWidget {font-family:"Microsoft YaHei","Segoe UI";font-size:12px;color:#38294d;background:#f7f2fc;}
+QPushButton {background:#efe6f8;border:1px solid #dfd0ed;border-radius:10px;padding:6px 11px;color:#5b3e70;}
+QPushButton:hover {background:#e4d3f2;} QPushButton:pressed {background:#d8c0e9;} QPushButton:disabled {color:#92869d;}
+QPlainTextEdit,QTextBrowser,QListWidget {background:#fff;border:1px solid #e5d9ef;border-radius:12px;padding:8px;}
+QListWidget {padding:6px;} QListWidget::item {padding:8px 9px;border-radius:9px;margin:2px 0;}
+QListWidget::item:selected {background:#eadcf5;color:#38294d;}'''
+
+CHAT_STYLE = '''
+QWidget#chatWindow {background:transparent;}
+QWidget#chatWindow QLabel {background:transparent;}
+QFrame#windowCard {background:#fff;border:1px solid #d8c6e7;border-radius:20px;}
+QFrame#contentShell {background:#fcfaff;border:1px solid #e5d9ee;border-radius:12px;}
+QFrame#titleBar {background:transparent;border:0;}
+QFrame#sidebarCard,QFrame#contentCard {background:#fff;border:1px solid #e7dcef;border-radius:13px;}
+QFrame#composerCard {background:#fcfaff;border:1px solid #e4d6ee;border-radius:12px;}
+QLabel#windowTitle {font-size:14px;font-weight:700;color:#65457e;}
+QLabel#sectionTitle {font-size:13px;font-weight:700;color:#563b6b;}
+QLabel#muted {color:#9888a5;font-size:10px;}
+QWidget#chatWindow QLabel#syncBadge {background:#f1e8f8;color:#76528c;border-radius:9px;padding:4px 8px;font-size:10px;}
+QLabel#pathLabel {color:#9584a2;font-size:10px;}
+QPushButton#windowControl {background:transparent;border:0;border-radius:8px;padding:0;color:#806b90;font-size:14px;}
+QPushButton#windowControl:hover {background:#eadcf5;color:#503768;}
+QPushButton#newChat,QPushButton#folderButton {background:#f2eaf8;border:0;border-radius:8px;padding:5px 9px;font-size:11px;}
+QPushButton#sendButton {background:#9a76b8;color:white;border:0;border-radius:8px;padding:5px 20px;}
+QPushButton#sendButton:hover {background:#8763a4;}
+QPushButton#sendButton:disabled {background:#d5c3e2;color:#fcfaff;}
+QListWidget#conversationList {background:white;border:0;border-radius:0;padding:0;}
+QListWidget#conversationList::item {padding:7px 8px;border-radius:7px;margin:2px 0;}
+QListWidget#conversationList::item:selected {background:#eadef3;color:#674881;}
+QPlainTextEdit#chatEditor {border:0;background:transparent;padding:6px;color:#574567;selection-background-color:#dfcbee;}
+QTextBrowser#transcript {border:0;border-radius:0;background:white;padding:2px;color:#463550;selection-background-color:#dfcbee;}
+QScrollBar:vertical {background:#f3edf8;width:7px;margin:0;border-radius:3px;}
+QScrollBar::handle:vertical {background:#cbb2df;min-height:34px;border-radius:3px;}
+QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {height:0;}
+QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical {background:none;}
+QScrollBar:horizontal {background:#f3edf8;height:7px;margin:0;border-radius:3px;}
+QScrollBar::handle:horizontal {background:#cbb2df;min-width:34px;border-radius:3px;}
+QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal {width:0;}
+QSizeGrip {background:transparent;width:12px;height:12px;}
+'''
+
+
+class ElidedLabel(QLabel):
+    """Keep long conversation names and paths inside their allotted row."""
+    def __init__(self,text='',parent=None):
+        super().__init__(text,parent)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+
+    def setText(self,text):
+        super().setText(text);self.setToolTip(text)
+
+    def paintEvent(self,event):
+        painter=QPainter(self);painter.setPen(self.palette().windowText().color())
+        painter.drawText(self.contentsRect(),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,
+                         QFontMetrics(self.font()).elidedText(self.text(),Qt.TextElideMode.ElideRight,self.contentsRect().width()))
 
 
 class Composer(QWidget):
@@ -82,32 +134,92 @@ class ChatWindow(QWidget):
     folder = Signal()
 
     def __init__(self):
-        super().__init__(None, Qt.WindowType.Window)
-        self.setWindowTitle('GPT白龙娘动态桌宠 · 历史对话')
-        self.resize(940, 680)
-        self.setMinimumSize(580, 440)
-        self.setStyleSheet(STYLE)
-        layout = QVBoxLayout(self)
-        toolbar = QHBoxLayout()
-        new = QPushButton('新对话'); new.clicked.connect(self.new_chat)
-        self.folder_button = QPushButton('选择任务文件夹'); self.folder_button.clicked.connect(self.folder)
-        self.status = QLabel('主人的叮嘱，我都记在这台电脑里啦')
-        toolbar.addWidget(new);toolbar.addWidget(self.folder_button);toolbar.addWidget(self.status, 1)
-        layout.addLayout(toolbar)
-        split = QSplitter()
-        self.list = QListWidget(); self.list.setMaximumWidth(250)
+        super().__init__(None, Qt.WindowType.Window|Qt.WindowType.FramelessWindowHint)
+        self.setWindowTitle('白龙聊天')
+        self.setObjectName('chatWindow')
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFont(QFont('Microsoft YaHei UI',9))
+        self.resize(920, 550)
+        self.setMinimumSize(660, 440)
+        self.setStyleSheet(STYLE + CHAT_STYLE)
+        self._drag_offset=None
+        layout = QVBoxLayout(self); layout.setContentsMargins(2, 2, 2, 2); layout.setSpacing(0)
+        card = QFrame(); card.setObjectName('windowCard'); layout.addWidget(card)
+        outer=QVBoxLayout(card);outer.setContentsMargins(10,10,10,10)
+        shell=QFrame();shell.setObjectName('contentShell');outer.addWidget(shell)
+        card_layout = QVBoxLayout(shell); card_layout.setContentsMargins(14, 8, 14, 8); card_layout.setSpacing(8)
+        self.title_bar = QFrame(); self.title_bar.setObjectName('titleBar')
+        self.title_bar.installEventFilter(self)
+        self.title_bar.setFixedHeight(28)
+        header = QHBoxLayout(self.title_bar); header.setContentsMargins(0,0,0,0); header.setSpacing(4)
+        title = QLabel('白龙聊天'); title.setObjectName('windowTitle'); header.addWidget(title)
+        title.installEventFilter(self);header.addStretch(1)
+        self.status = QLabel('主人的叮嘱，我都记在这台电脑里啦');self.status.setObjectName('muted');self.status.hide()
+        self.min_button=QPushButton('−');self.max_button=QPushButton('□');self.close_button=QPushButton('×')
+        for button in (self.min_button,self.max_button,self.close_button):
+            button.setObjectName('windowControl');button.setFixedSize(28,24);header.addWidget(button)
+        self.min_button.setToolTip('最小化');self.max_button.setToolTip('最大化 / 还原');self.close_button.setToolTip('关闭聊天窗口')
+        self.min_button.clicked.connect(self.showMinimized)
+        self.max_button.clicked.connect(self._toggle_maximized)
+        self.close_button.clicked.connect(self.close)
+        card_layout.addWidget(self.title_bar)
+
+        body = QHBoxLayout(); body.setSpacing(10); card_layout.addLayout(body, 1)
+        sidebar = QFrame(); sidebar.setObjectName('sidebarCard'); sidebar.setFixedWidth(188); sidebar_layout = QVBoxLayout(sidebar); sidebar_layout.setContentsMargins(10, 10, 10, 10); sidebar_layout.setSpacing(8)
+        side_header=QHBoxLayout()
+        side_title = QLabel('会话'); side_title.setObjectName('sectionTitle');side_header.addWidget(side_title,1)
+        new=QPushButton('+ 新建');new.setObjectName('newChat');new.clicked.connect(self.new_chat);side_header.addWidget(new);sidebar_layout.addLayout(side_header)
+        self.list = QListWidget(); self.list.setObjectName('conversationList');self.list.setMinimumWidth(0); self.list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.list.currentItemChanged.connect(lambda item, old: self.selected.emit(item.data(Qt.ItemDataRole.UserRole)) if item else None)
-        self.view = QTextBrowser(); self.view.setOpenExternalLinks(False);self.view.setOpenLinks(False)
-        split.addWidget(self.list);split.addWidget(self.view);split.setSizes([210, 700]);layout.addWidget(split, 1)
-        self.editor = QPlainTextEdit();self.editor.setMaximumHeight(90)
-        self.editor.setPlaceholderText('主人，我们接着聊吧… Ctrl+Enter 发送')
-        layout.addWidget(self.editor)
-        row = QHBoxLayout();self.path_label = QLabel();self.path_label.setWordWrap(True);row.addWidget(self.path_label, 1)
+        sidebar_layout.addWidget(self.list, 1)
+        side_hint = QLabel('与 Codex 中的会话记录同步'); side_hint.setObjectName('muted'); side_hint.setWordWrap(True); sidebar_layout.addWidget(side_hint)
+        body.addWidget(sidebar)
+
+        content = QFrame(); content.setObjectName('contentCard'); content_layout = QVBoxLayout(content); content_layout.setContentsMargins(12, 12, 12, 10); content_layout.setSpacing(8)
+        content_header=QHBoxLayout()
+        self.chat_title = ElidedLabel('白龙聊天'); self.chat_title.setObjectName('sectionTitle');content_header.addWidget(self.chat_title,1)
+        sync=QLabel('会话同步');sync.setObjectName('syncBadge');content_header.addWidget(sync);content_layout.addLayout(content_header)
+        self.view = QTextBrowser(); self.view.setObjectName('transcript'); self.view.setOpenExternalLinks(False); self.view.setOpenLinks(False); content_layout.addWidget(self.view, 1)
+        self.view.document().setDefaultFont(QFont('Microsoft YaHei UI',9))
+        self.view.document().setDefaultStyleSheet('body {color:#463550;font-family:"Microsoft YaHei UI";} h3 {font-size:13px;margin:12px 0 6px;} p {margin:4px 0 10px;}')
+        composer = QFrame(); composer.setObjectName('composerCard'); composer_layout = QVBoxLayout(composer); composer_layout.setContentsMargins(8, 6, 8, 6); composer_layout.setSpacing(4)
+        composer.setFixedHeight(128)
+        self.editor = QPlainTextEdit(); self.editor.setObjectName('chatEditor'); self.editor.setPlaceholderText('继续这段对话… Ctrl+Enter 发送'); composer_layout.addWidget(self.editor,1)
+        composer_row = QHBoxLayout(); composer_row.setSpacing(6)
+        self.folder_button=QPushButton('文件夹');self.folder_button.setObjectName('folderButton');self.folder_button.clicked.connect(self.folder);composer_row.addWidget(self.folder_button)
+        composer_hint = QLabel('Enter 换行'); composer_hint.setObjectName('muted'); composer_row.addWidget(composer_hint, 1)
         self.stop_button = QPushButton('停止任务');self.stop_button.clicked.connect(self.stop);self.stop_button.hide()
-        self.send_button = QPushButton('发送');self.send_button.clicked.connect(self.submit)
-        row.addWidget(self.stop_button);row.addWidget(self.send_button);layout.addLayout(row)
+        self.send_button = QPushButton('发送');self.send_button.setObjectName('sendButton');self.send_button.clicked.connect(self.submit)
+        composer_row.addWidget(self.stop_button);composer_row.addWidget(self.send_button);composer_layout.addLayout(composer_row)
+        content_layout.addWidget(composer)
+        body.addWidget(content, 1)
+        self.path_label = ElidedLabel(); self.path_label.setObjectName('pathLabel'); card_layout.addWidget(self.path_label)
+        self.size_grip=QSizeGrip(self);self.size_grip.setToolTip('拖动调整窗口大小')
         from PySide6.QtGui import QShortcut, QKeySequence
         self.shortcut = QShortcut(QKeySequence('Ctrl+Return'), self); self.shortcut.activated.connect(self.submit)
+
+    def _toggle_maximized(self):
+        if self.isMaximized():self.showNormal()
+        else:self.showMaximized()
+
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        if hasattr(self,'size_grip'):self.size_grip.move(self.width()-17,self.height()-17)
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self,'title_bar',None) or (isinstance(obj,QLabel) and obj.parent() is getattr(self,'title_bar',None)):
+            if event.type()==QEvent.Type.MouseButtonDblClick and event.button()==Qt.MouseButton.LeftButton:
+                self._toggle_maximized();self._drag_offset=None;return True
+            if event.type()==QEvent.Type.MouseButtonPress and event.button()==Qt.MouseButton.LeftButton:
+                handle=self.windowHandle()
+                if handle and handle.startSystemMove():return True
+                self._drag_offset=event.globalPosition().toPoint()-self.frameGeometry().topLeft();return True
+            if event.type()==QEvent.Type.MouseMove and getattr(self,'_drag_offset',None) is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                self.move(event.globalPosition().toPoint()-self._drag_offset);return True
+            if event.type()==QEvent.Type.MouseButtonRelease:
+                self._drag_offset=None;return True
+        return super().eventFilter(obj,event)
 
     def submit(self):
         text=self.editor.toPlainText().strip()
@@ -247,8 +359,8 @@ class ChatController(QObject):
         self.composer.busy(True);self.window.busy(True)
         self.pet.task_started()
         if not self.pet.task_bubbles_disabled:
-            self.pet.say('主人，我收到啦！这就认真帮你处理。',4000)
-            self.pet.bubble.is_task_bubble=True
+            chat_id=self.active['id']
+            self.pet.task_progress('主人，我收到啦！','这就认真帮你处理。',lambda:self.open_history(chat_id))
         previous=getattr(self.worker,'session',None) if self.worker else None
         mode='work'
         if previous and (previous.thread_id!=self.active.get('threadId') or previous.mode!=mode):previous.close();previous=None
@@ -364,8 +476,10 @@ class ChatController(QObject):
     def render(self):
         chat=self.active
         if not chat:
+            self.window.chat_title.setText('白龙聊天')
             self.window.view.setPlainText('主人，我在这里等你呀。把想做的事写在下方，我们就可以开始啦。')
             self.window.path_label.setText('我会把任务文件放在这里：'+str(self.default_cwd));return
+        self.window.chat_title.setText(chat.get('title') or '整理项目说明')
         self.window.path_label.setText('任务文件夹：'+chat['cwd'])
         def block(title,text,color='#38294d'):
             return '<h3 style="color:'+color+'">'+html.escape(title)+'</h3><p style="white-space:pre-wrap">'+html.escape(text)+'</p>'

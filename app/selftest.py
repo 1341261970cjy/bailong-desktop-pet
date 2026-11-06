@@ -1,14 +1,39 @@
-"""Offline smoke check executed by the shipped EXE, without a Python install."""
-import os,json,time,traceback
+"""Shipped EXE checks; live interfaces are queried only by explicit options."""
+import os,json,time,traceback,sys
 from pathlib import Path
 
 def run(root):
     os.environ['QT_QPA_PLATFORM']='offscreen'
     report={'passed':False,'checks':[],'frozen':False}
+    report_name='中转站接口检查报告.json' if '--station-only' in sys.argv else ('额度接口检查报告.json' if '--quota-only' in sys.argv else '检查报告.json')
     try:
-        import sys
         from version import VERSION
         report.update(version=VERSION,frozen=bool(getattr(sys,'frozen',False)))
+        if '--station-only' in sys.argv:
+            import ssl
+            from urllib.request import getproxies
+            from PySide6.QtCore import QSettings
+            from station import DEFAULT_BASE_URL,StationFailure,fetch_station
+            settings=QSettings('BailongPet','DesktopPet')
+            key=str(settings.value('stationApiKey','')).strip()
+            report['keyConfigured']=bool(key)
+            context=ssl.create_default_context()
+            report['network']={'openssl':ssl.OPENSSL_VERSION,'trustedCertificates':context.cert_store_stats(),
+                               'proxySchemes':sorted(getproxies())}
+            try:
+                billing_token=str(settings.value('stationBillingToken','')).strip()
+                report['todayQueryConfigured']=bool(billing_token)
+                snapshot=fetch_station(key,str(settings.value('stationBaseUrl',DEFAULT_BASE_URL)),billing_access_token=billing_token,account_id=str(settings.value('stationAccountId','')))
+                report['walletReturned']=snapshot.get('walletBalance') is not None
+                report['usageReturned']=snapshot.get('tokenUsed') is not None
+                report['todayReturned']=snapshot.get('todayUsed') is not None
+                report['todayStatus']=snapshot.get('todayError')
+                report['callLatencyReturned']=snapshot.get('latencyFirstTokenMs') is not None or snapshot.get('latencyTotalMs') is not None
+                report['passed']=report['walletReturned'] and report['usageReturned'] and (not billing_token or report['todayReturned'])
+            except StationFailure as error:
+                report['error']=str(error);report['errorCode']=error.code
+            (root/'中转站接口检查报告.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+            return 0 if report['passed'] else 1
         if '--chat-only' in sys.argv:
             from chat_backend import CodexSession
             folder=root/'对话自检任务';folder.mkdir(exist_ok=True)
@@ -71,7 +96,7 @@ def run(root):
             turn={'prompt':'离线界面检查','created':'selftest','status':'running','output':'','events':[]}
             conversation['turns'].append(turn);chat.active=conversation;chat.running_chat=conversation;chat.running_turn=turn
             chat.completed({'threadId':'offline-test','text':'检查结果\n'*30,'transcript':'检查结果\n'*30})
-            assert any(b.text()=='详情' for b in pet.bubble.findChildren(__import__('PySide6.QtWidgets',fromlist=['QPushButton']).QPushButton))
+            assert any(b.text()=='详情' for b in pet.task_bubble.findChildren(__import__('PySide6.QtWidgets',fromlist=['QPushButton']).QPushButton))
             assert chat.composer.size()==QSize(280,152)
             assert pet.mode=='task-celebration' and pet.current['id']=='18'
             assert len(pet.interaction_animations())==20
@@ -79,7 +104,7 @@ def run(root):
             pet.play(pet.work_slots[1],'working');assert chat.composer.isVisible()
             pet.say('自动工作不显示台词');assert not pet.bubble.isVisible()
             pet.task_progress('主人，我正在理清思路…','公开进度摘要',lambda:None)
-            assert pet.bubble.isVisible() and pet.bubble.is_task_progress
+            assert pet.task_bubble.isVisible() and pet.task_bubble.is_task_progress
             report['checks'].append('成功庆祝一次、可滚动结果和详情、20项手动互动、工作时保留输入框与公开进度气泡正常')
             chat.shutdown();pet.chat=None
         report['checks'].append('对话开关、下方输入框、三类动画菜单、历史保存与长结果详情正常（离线检查）')
@@ -92,5 +117,5 @@ def run(root):
         pet.play(pet.idles[0],'idle');pet.grab().save(str(root/'检查预览.png'));pet.close()
         report['passed']=True
     except Exception:report['error']=traceback.format_exc()
-    (root/('额度接口检查报告.json' if '--quota-only' in __import__('sys').argv else '检查报告.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    (root/report_name).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     return 0 if report['passed'] else 1
