@@ -864,6 +864,13 @@ class Pet(QWidget):
         menu.addSeparator()
         automatic=menu.addAction('全屏时自动隐藏');automatic.setCheckable(True)
         automatic.setChecked(self.auto_hide_fullscreen);automatic.toggled.connect(self.set_auto_hide_fullscreen)
+        startup=menu.addAction('随 GPT 自动启动');startup.setCheckable(True)
+        try:
+            from autostart import autostart_enabled
+            startup.setChecked(autostart_enabled())
+        except Exception:
+            startup.setChecked(False)
+        startup.toggled.connect(self.set_autostart)
         menu.addSeparator()
         menu.addAction('关闭对话模式' if self.chat and self.chat.enabled else '打开对话模式',self.toggle_chat)
         menu.addAction('查看历史对话',self.open_history)
@@ -903,6 +910,17 @@ class Pet(QWidget):
         menu.addSeparator()
         menu.addAction('退出桌宠',self.close)
         return menu
+
+    def set_autostart(self,enabled):
+        """Register or remove the GPT transition monitor from the menu."""
+        try:
+            from autostart import enable_autostart,disable_autostart
+            if enabled:
+                enable_autostart();self.say('已开启：GPT启动时会自动显示桌宠。',3500)
+            else:
+                disable_autostart();self.say('已关闭随GPT自动启动。',3500)
+        except Exception as error:
+            self.say('自动启动设置失败：'+str(error),7000)
 
     def show_station_settings(self):
         """Configure the read-only DogAPI API key without exposing it in the UI."""

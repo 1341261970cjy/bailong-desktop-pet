@@ -33,6 +33,15 @@ def startup_entry():
     if result!=0:raise RuntimeError('无法找到当前用户的Windows启动文件夹。')
     return Path(buffer.value)/'BailongPetAutostart.vbs'
 
+def autostart_enabled():
+    """Whether this installation has a startup monitor registered."""
+    if sys.platform=='darwin':
+        # macOS launch-agent discovery is intentionally kept in its platform
+        # module; absence of a query there should leave the switch unchecked.
+        return False
+    try:return startup_entry().is_file()
+    except (AttributeError,OSError):return False
+
 def enable_autostart():
     if sys.platform=='darwin':
         from mac_autostart import enable
